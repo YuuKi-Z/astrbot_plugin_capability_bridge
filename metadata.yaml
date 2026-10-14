@@ -1,0 +1,7 @@
+name: astrbot_plugin_capability_bridge
+display_name: 能力桥
+desc: 扫描已安装插件，使用模型生成并校验自然语言调用规则，支持按版本增量适配和能力检索。
+version: v0.1.1
+author: YuuKi-Z
+astrbot_version: ">=4.29.0,<5"
+repo: https://github.com/YuuKi-Z/astrbot_plugin_capability_bridge

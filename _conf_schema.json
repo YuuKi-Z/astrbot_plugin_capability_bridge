@@ -1,0 +1,7 @@
+{
+  "enabled": {
+    "description": "启用自然语言能力检索与调用；分析模型和适配设置在插件的能力中心视图中管理。",
+    "type": "bool",
+    "default": true
+  }
+}

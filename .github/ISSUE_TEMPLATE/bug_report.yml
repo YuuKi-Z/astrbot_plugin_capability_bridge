@@ -1,0 +1,43 @@
+name: 问题反馈
+description: 报告安装、适配或能力调用问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: 请勿提交 API Key、真实账号、绑定表或未脱敏的聊天记录。
+  - type: input
+    id: astrbot_version
+    attributes:
+      label: AstrBot 版本
+    validations:
+      required: true
+  - type: input
+    id: bridge_version
+    attributes:
+      label: 能力桥版本
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: 消息平台与部署方式
+      placeholder: 例如 QQ OneBot v11 / Docker
+  - type: input
+    id: target_plugin
+    attributes:
+      label: 目标插件名称、版本和仓库地址
+  - type: input
+    id: model
+    attributes:
+      label: 分析模型与聊天模型名称
+      description: 只填写模型名称，不需要服务地址或凭据。
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤与预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: 错误提示或已脱敏日志

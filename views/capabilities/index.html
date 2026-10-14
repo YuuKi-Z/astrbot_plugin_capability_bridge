@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>能力中心 · 能力桥</title><link rel="stylesheet" href="./style.css"></head>
+<body>
+<main>
+  <header><div><span class="eyebrow">CAPABILITY BRIDGE</span><h1>把插件，变成一句话的事。</h1><p>扫描已安装的功能，用选定的模型生成适配。聊天时由机器人理解需求，调用原插件完成。</p></div><span class="badge" id="connection">正在连接</span></header>
+  <section class="settings"><div><h2>分析模型</h2><p>按需分析新增或变化的插件，自动分批完成；日常对话复用规则。</p></div><div class="controls"><select id="provider" aria-label="分析模型"></select><button id="save">保存设置</button></div></section>
+  <div id="notice" role="status" hidden></div>
+  <section class="overview"><div><strong id="count-ready">0</strong><span>可用适配能力</span></div><div><strong id="count-native">0</strong><span>原生工具</span></div><div><strong id="count-changed">0</strong><span>待分析 / 有更新</span></div><div class="actions"><button id="scan">刷新扫描</button><button id="adapt" class="primary">一键适配变更</button></div></section>
+  <section id="job" hidden><div class="job-head"><h2 id="job-title">适配任务</h2><button id="cancel">停止剩余分析</button></div><progress id="progress" max="1" value="0"></progress><p id="usage" class="small"></p><ul id="job-items"></ul></section>
+  <div class="list-head"><h2>插件能力</h2><input id="search" placeholder="搜索插件或能力" aria-label="搜索插件或能力"></div>
+  <div id="plugins"></div>
+  <footer>保持原调用者身份与原插件权限。源码更新后，旧适配暂停使用，重新适配即可。</footer>
+</main><script type="module" src="./app.js"></script></body></html>
