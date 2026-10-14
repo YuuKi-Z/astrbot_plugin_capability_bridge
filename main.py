@@ -439,7 +439,7 @@ class CapabilityBridge(Star):
             query(string): 用户的功能需求，保留插件名、游戏名、动作、查询对象等关键信息。
         """
         if not self.config.get("enabled", True):
-            return '{"error":"能力桥已停用"}'
+            return '{"error":"自然语言指令已停用"}'
         if self.dirty:
             await self.refresh()
         query = str(query)[:1000].casefold()
@@ -510,7 +510,7 @@ class CapabilityBridge(Star):
             arguments(object): 严格符合该能力 input_schema 的参数对象；对象必须来自用户的明确请求。
         """
         if not self.config.get("enabled", True):
-            return '{"error":"能力桥已停用"}'
+            return '{"error":"自然语言指令已停用"}'
         if self.dirty:
             await self.refresh()
         cache = event.get_extra("capability_bridge_runs", None)

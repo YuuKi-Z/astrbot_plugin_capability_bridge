@@ -17,7 +17,7 @@ async function action(endpoint, body={}, message='已完成') {
 function render() {
   const s=snapshot;
   const opened=new Set([...document.querySelectorAll('article[data-plugin]')].filter(e=>e.querySelector('details')?.open).map(e=>e.dataset.plugin));
-  $('connection').textContent=s.enabled?'已连接 · 能力桥运行中':'能力桥已停用';
+  $('connection').textContent=s.enabled?'已连接 · 自然语言指令运行中':'自然语言指令已停用';
   if(!settingsLoaded){
     $('provider').replaceChildren(node('option','选择已配置的聊天模型'));
     $('provider').firstChild.value='';

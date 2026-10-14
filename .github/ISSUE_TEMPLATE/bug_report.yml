@@ -14,7 +14,7 @@ body:
   - type: input
     id: bridge_version
     attributes:
-      label: 能力桥版本
+      label: 自然语言指令版本
     validations:
       required: true
   - type: input
