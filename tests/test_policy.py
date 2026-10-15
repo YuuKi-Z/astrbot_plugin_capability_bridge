@@ -67,6 +67,14 @@ class PolicyTests(unittest.TestCase):
             self.pending.consume(self.event, codes[0])
         self.assertEqual(len(self.pending.items), 4)
 
+    def test_source_update_keeps_admin_restriction_until_re_review(self):
+        state = {
+            "policies": {"cap_example": {"mode": "admin_confirm", "fingerprint": "v1"}}
+        }
+        self.assertEqual(
+            call_policy(state, "cap_example", "v2"), ("admin_confirm", False)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

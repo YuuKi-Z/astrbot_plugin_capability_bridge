@@ -4,11 +4,20 @@
 <body>
 <main>
   <header><div><span class="eyebrow">自然语言指令</span><h1>把插件，变成一句话的事。</h1><p>不用记命令，用自然语言调用插件指令和工具。</p></div><span class="badge" id="connection">正在连接</span></header>
-  <section class="settings"><div><h2>分析模型</h2><p>按需分析新增或变化的插件，自动分批完成；日常对话复用规则。</p></div><div class="controls"><select id="provider" aria-label="分析模型"></select><button id="save">保存设置</button></div></section>
+  <nav class="page-tabs" role="tablist" aria-label="能力中心页面"><button id="tab-analysis" role="tab" aria-controls="page-analysis" aria-selected="true">分析适配</button><button id="tab-settings" role="tab" aria-controls="page-settings" aria-selected="false">设置</button></nav>
   <div id="notice" role="status" hidden></div>
+  <section id="page-analysis" role="tabpanel" aria-labelledby="tab-analysis">
+  <section class="settings"><div><h2>分析模型</h2><p>按需分析新增或变化的插件，自动分批完成；日常对话复用规则。</p></div><div class="controls"><select id="provider" aria-label="分析模型"></select><button id="save">保存分析模型</button></div></section>
   <section class="overview"><div><strong id="count-ready">0</strong><span>可用适配能力</span></div><div><strong id="count-native">0</strong><span>原生工具</span></div><div><strong id="count-changed">0</strong><span>待分析 / 有更新</span></div><div class="actions"><button id="scan">刷新扫描</button><button id="adapt" class="primary">一键适配变更</button></div></section>
   <section id="job" hidden><div class="job-head"><h2 id="job-title">适配任务</h2><button id="cancel">停止剩余分析</button></div><progress id="progress" max="1" value="0"></progress><p id="usage" class="small"></p><ul id="job-items"></ul></section>
   <div class="list-head"><h2>插件能力</h2><input id="search" placeholder="搜索插件或能力" aria-label="搜索插件或能力"></div>
   <div id="plugins"></div>
-  <footer>新能力默认需本人确认。可把已审阅的查询设为直接调用，把高影响操作设为仅管理员且需确认；原插件权限仍然有效。插件更新后请重新审阅。这里的调用方式适用于适配指令，原生工具沿用 AstrBot 与原插件的控制。</footer>
+  <footer id="policy-summary"></footer>
+  </section>
+  <section id="page-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+    <section class="settings-card"><h2>对话与调用</h2><p>选择理解日常需求、决定调用哪些工具的模型。分析模型在“分析适配”页面设置。</p><label class="switch-row"><input id="setting-enabled" type="checkbox"><span>启用自然语言指令</span></label><label class="field-label" for="execution-provider">对话 / 调用模型</label><select id="execution-provider" aria-label="对话 / 调用模型"></select><p class="small">留空沿用 AstrBot 当前模型。手动选择后，作用于允许会话中的本地 Agent 对话和工具调用，不额外增加一轮模型请求；第三方托管 Agent 不切换。</p></section>
+    <section class="settings-card"><h2>操作确认</h2><label class="switch-row"><input id="setting-confirmation" type="checkbox"><span>启用二次确认</span></label><p>开启时按每项能力的调用方式确认。关闭后省去确认步骤，“仅管理员”和原插件权限仍然有效。</p><p class="small">切换开关会取消旧的待确认操作，不会自动执行。原生工具继续沿用 AstrBot 与原插件自己的控制。</p></section>
+    <section class="settings-card"><h2>使用范围</h2><p>以下范围仅控制本插件的自然语言入口，不影响机器人原有指令或其他插件。黑名单优先，管理员也遵守。</p><label class="switch-row"><input id="setting-private" type="checkbox"><span>允许私聊使用</span></label><label class="switch-row"><input id="setting-whitelist-enabled" type="checkbox"><span>启用群白名单</span></label><p class="small">开启后只有白名单中的群可以使用；开启但名单为空时，所有群均不允许。</p><div class="scope-grid"><div><label class="field-label" for="group-whitelist">群白名单</label><textarea id="group-whitelist" rows="5" placeholder="每行一个群号或群 ID"></textarea></div><div><label class="field-label" for="group-blacklist">群黑名单</label><textarea id="group-blacklist" rows="5" placeholder="这些群始终不允许使用"></textarea></div></div><label class="field-label" for="user-blacklist">用户黑名单</label><textarea id="user-blacklist" rows="4" placeholder="每行一个用户 ID，群聊和私聊均生效"></textarea><p class="small">可填写普通 ID，或 平台名:ID，例如 aiocqhttp:123456。每行一项，也可以用逗号分隔。</p></section>
+    <div class="settings-actions"><button id="reload-settings">重新载入设置</button><button id="save-settings" class="primary">保存设置</button></div>
+  </section>
 </main><script type="module" src="./app.js"></script></body></html>

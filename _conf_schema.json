@@ -1,7 +1,59 @@
 {
   "enabled": {
-    "description": "让机器人通过自然语言调用插件指令和工具。请在“能力中心”选择分析模型并管理适配。",
+    "description": "启用自然语言指令",
     "type": "bool",
     "default": true
+  },
+  "confirmation_enabled": {
+    "description": "启用二次确认",
+    "hint": "关闭后跳过适配指令的确认步骤，管理员限制和原插件权限仍然有效。切换时旧确认码失效，不会自动执行待确认操作。",
+    "type": "bool",
+    "default": true
+  },
+  "analysis_provider_id": {
+    "description": "分析模型",
+    "hint": "用于分析已安装插件并生成适配。也可以在能力中心的分析页面选择。留空时需要先选择模型再分析。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "execution_provider_id": {
+    "description": "对话 / 调用模型",
+    "hint": "留空沿用 AstrBot 当前模型；选择后用于允许会话中的本地 Agent 对话和工具调用。不会额外增加一轮模型请求，不切换第三方托管 Agent。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "allow_private_chat": {
+    "description": "允许私聊使用",
+    "type": "bool",
+    "default": true
+  },
+  "group_whitelist_enabled": {
+    "description": "启用群白名单",
+    "hint": "开启后只有名单中的群可以使用本插件；名单为空时所有群均不允许。管理员也遵守此范围。",
+    "type": "bool",
+    "default": false
+  },
+  "group_whitelist": {
+    "description": "群白名单",
+    "hint": "填写群号或群 ID，每项一个；也支持 平台名:群ID，例如 aiocqhttp:123456。",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": []
+  },
+  "group_blacklist": {
+    "description": "群黑名单",
+    "hint": "名单中的群不能使用本插件，优先级高于白名单。其他插件及其原生工具不受这里影响。",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": []
+  },
+  "user_blacklist": {
+    "description": "用户黑名单",
+    "hint": "名单中的用户在群聊和私聊均不能使用本插件；支持用户 ID 或 平台名:用户ID。",
+    "type": "list",
+    "items": {"type": "string"},
+    "default": []
   }
 }

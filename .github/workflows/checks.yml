@@ -31,4 +31,4 @@ jobs:
       - name: Check approval boundaries
         env:
           PYTHONPATH: ..
-        run: python -m unittest astrbot_plugin_capability_bridge.tests.test_policy -v
+        run: python -m unittest astrbot_plugin_capability_bridge.tests.test_policy astrbot_plugin_capability_bridge.tests.test_settings -v

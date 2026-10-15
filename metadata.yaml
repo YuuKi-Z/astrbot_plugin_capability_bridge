@@ -2,7 +2,7 @@ name: astrbot_plugin_capability_bridge
 display_name: 自然语言指令
 short_desc: 不用记命令，用自然语言调用插件指令和工具。
 desc: 扫描已安装插件，通过模型生成并校验适配规则，让机器人理解用户需求、解析参数并调用原插件完成任务。支持能力检索、适配缓存和插件更新后重新适配。
-version: v0.2.0
+version: v0.3.0
 author: YuuKi-Z
 astrbot_version: ">=4.29.0,<5"
 repo: https://github.com/YuuKi-Z/astrbot_plugin_capability_bridge

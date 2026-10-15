@@ -19,6 +19,9 @@ def call_policy(state: dict, capability_id: str, fingerprint: str) -> tuple[str,
         and saved.get("mode") in POLICY_MODES
     ):
         return saved["mode"], True
+    if isinstance(saved, dict) and saved.get("mode") == "admin_confirm":
+        # Source changes revoke prior allowances without removing restrictions.
+        return "admin_confirm", False
     return "confirm", False
 
 

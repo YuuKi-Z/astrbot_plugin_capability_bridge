@@ -1,6 +1,7 @@
 """Discover plugin interfaces, generate cached mappings, and expose two tools."""
 
 import asyncio
+import copy
 import functools
 import json
 import math
@@ -22,6 +23,7 @@ from .policy import POLICY_MODES, PendingCalls, call_policy
 from .prompts import ANALYZE_PROMPT
 from .runtime import CapabilityError, check_access, execute
 from .scanner import PLUGIN_NAME, analysis_document, scan
+from .settings import access_error, read_settings, settings_revision, validate_update
 
 BRIDGE_INSTRUCTION = """\n[CAPABILITY_BRIDGE]
 用户明确请求执行某个功能时，主动判断并调用可用工具。需要查找插件功能时先调用 capability_find，按返回的参数说明调用 capability_run；原生工具直接用其原名调用。不把‘能不能帮我查/生成’仅回答成能力介绍。缺少必要信息才追问。能力不存在或未适配要如实说明，不能编造已执行。target_user 必须来自用户的明确指代，查别人不能替换成自己。工具返回 delivered/do_not_repeat 表示原插件已发送结果，不重复转述整份结果。\n"""
@@ -57,6 +59,9 @@ class CapabilityBridge(Star):
                 self.state["adaptations"] = loaded.get("adaptations", {})
                 if isinstance(loaded.get("policies"), dict):
                     self.state["policies"] = loaded["policies"]
+                self.state["config_settings_migrated"] = bool(
+                    loaded.get("config_settings_migrated", False)
+                )
             except (OSError, ValueError):
                 logger.warning("Capability bridge state could not be loaded")
         self.catalog = {}
@@ -64,6 +69,18 @@ class CapabilityBridge(Star):
         self.scan_lock = asyncio.Lock()
         self.job_task = None
         self.confirmations = PendingCalls()
+        self.closed = False
+        self._controls_generation = 0
+        self._controls_revision = settings_revision(
+            read_settings(self.config), controls_only=True
+        )
+        if not self.state.get("config_settings_migrated"):
+            legacy_provider = self.state["settings"].get("provider_id", "")
+            if legacy_provider and not self.config.get("analysis_provider_id"):
+                self.config["analysis_provider_id"] = legacy_provider
+                self.config.save_config()
+            self.state["config_settings_migrated"] = True
+            self.save()
         self.job = {"status": "idle", "items": [], "tokens": 0, "estimated_tokens": 0}
         for path, handler, methods in [
             ("status", self.api_status, ["GET"]),
@@ -85,6 +102,42 @@ class CapabilityBridge(Star):
             json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         temporary.replace(self.state_path)
+
+    def settings(self) -> dict:
+        """Read the native plugin configuration, shared by both settings UIs."""
+        values = read_settings(self.config)
+        revision = settings_revision(values, controls_only=True)
+        if getattr(self, "_controls_revision", revision) != revision:
+            self.confirmations.items.clear()
+            self._controls_generation = getattr(self, "_controls_generation", 0) + 1
+        self._controls_revision = revision
+        return values
+
+    def ensure_access(self, event) -> dict:
+        """Check current scope again at execution time, including confirmations."""
+        if getattr(self, "closed", False):
+            raise CapabilityError("插件已重载，请重新发起需求")
+        try:
+            values = self.settings()
+        except ValueError as exc:
+            raise CapabilityError("插件设置无效，请管理员检查配置") from exc
+        error = access_error(values, event, PLUGIN_NAME)
+        if error:
+            raise CapabilityError(error)
+        token = self.controls_token(values)
+        previous = event.get_extra("capability_bridge_controls")
+        if previous is not None and previous != token:
+            raise CapabilityError("运行设置已变化，请重新发起需求；旧请求不会自动执行")
+        event.set_extra("capability_bridge_controls", token)
+        return values
+
+    def controls_token(self, values) -> str:
+        """Include a generation so toggling off and back on cannot revive old calls."""
+        return (
+            settings_revision(values, controls_only=True)
+            + ":"
+            + str(getattr(self, "_controls_generation", 0))
+        )
 
     async def refresh(self):
         """Refresh free interface metadata, serializing concurrent requests."""
@@ -170,7 +223,8 @@ class CapabilityBridge(Star):
             providers.append({"id": meta.id, "model": provider.get_model()})
         return {
             "enabled": bool(self.config.get("enabled", True)),
-            "settings": self.state["settings"],
+            "settings": self.settings(),
+            "settings_revision": settings_revision(self.settings()),
             "providers": providers,
             "plugins": plugins,
             "job": self.job,
@@ -192,22 +246,40 @@ class CapabilityBridge(Star):
         return json_response(self.status())
 
     async def api_settings(self):
-        """Save the existing provider used for source analysis."""
+        """Save validated partial updates to the native plugin configuration."""
         if not request.username:
             return error_response("需要登录管理后台", status_code=401)
         data = await request.json(default={})
         if not isinstance(data, dict):
             return error_response("设置必须为对象")
-        settings = dict(self.state["settings"])
+        data = dict(data)
+        revision = data.pop("revision", None)
+        current = self.settings()
+        if revision is not None and revision != settings_revision(current):
+            return error_response(
+                "设置已在其他页面更改，请重新载入后再保存", status_code=409
+            )
+        # Accept the previous analysis-page field during rolling upgrades.
         if "provider_id" in data:
-            if data["provider_id"] not in {
-                p.meta().id for p in self.context.get_all_providers()
-            }:
-                return error_response("请选择已配置的聊天模型")
-            settings["provider_id"] = data["provider_id"]
-        self.state["settings"] = settings
-        self.save()
-        return json_response({"saved": True})
+            if "analysis_provider_id" in data:
+                return error_response("分析模型字段重复")
+            data["analysis_provider_id"] = data.pop("provider_id")
+        try:
+            values = validate_update(
+                current, data, {p.meta().id for p in self.context.get_all_providers()}
+            )
+        except ValueError as exc:
+            return error_response(str(exc))
+        original = dict(self.config)
+        self.config.update(values)
+        try:
+            self.config.save_config()
+        except Exception:
+            self.config.clear()
+            self.config.update(original)
+            raise
+        self.settings()  # Invalidate pending approvals when runtime controls change.
+        return json_response({"saved": True, "revision": settings_revision(values)})
 
     async def api_adapt(self):
         """Start one background job for selected or changed plugins."""
@@ -223,7 +295,7 @@ class CapabilityBridge(Star):
             or any(n not in self.catalog for n in selected)
         ):
             return error_response("插件选择无效")
-        settings = dict(self.state["settings"])
+        settings = {"provider_id": self.settings()["analysis_provider_id"]}
         if settings["provider_id"] not in {
             p.meta().id for p in self.context.get_all_providers()
         }:
@@ -467,12 +539,36 @@ class CapabilityBridge(Star):
                 return json_response({"saved": True})
         return error_response("能力不存在", status_code=404)
 
+    @filter.on_waiting_llm_request(priority=-20000)
+    async def select_execution_model(self, event: AstrMessageEvent):
+        """Select the existing provider before AstrBot builds its local agent."""
+        try:
+            settings = self.ensure_access(event)
+        except CapabilityError:
+            return
+        if provider_id := settings["execution_provider_id"]:
+            event.set_extra("selected_provider", provider_id)
+            event.set_extra("selected_model", None)
+            pending_request = event.get_extra("provider_request")
+            if pending_request is not None and hasattr(pending_request, "model"):
+                pending_request.model = None
+
     @filter.on_llm_request(priority=-20000)
     async def prepare_request(self, event: AstrMessageEvent, req):
         """Attach a compact instruction after other plugins assemble tools."""
-        if not self.config.get("enabled", True):
-            return
         available = getattr(req.func_tool, "tools", []) if req.func_tool else []
+        try:
+            self.ensure_access(event)
+        except CapabilityError:
+            event.set_extra("capability_bridge_native", [])
+            if req.func_tool:
+                req.func_tool = copy.copy(req.func_tool)
+                req.func_tool.tools = [
+                    t
+                    for t in available
+                    if t.name not in {"capability_find", "capability_run"}
+                ]
+            return
         event.set_extra(
             "capability_bridge_native",
             [
@@ -495,8 +591,10 @@ class CapabilityBridge(Star):
         Args:
             query(string): 用户的功能需求，保留插件名、游戏名、动作、查询对象等关键信息。
         """
-        if not self.config.get("enabled", True):
-            return '{"error":"自然语言指令已停用"}'
+        try:
+            self.ensure_access(event)
+        except CapabilityError as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
         if self.dirty:
             await self.refresh()
         query = str(query)[:1000].casefold()
@@ -576,8 +674,10 @@ class CapabilityBridge(Star):
             capability_id(string): capability_find 返回的适配能力 id。
             arguments(object): 严格符合该能力 input_schema 的参数对象；对象必须来自用户的明确请求。
         """
-        if not self.config.get("enabled", True):
-            return '{"error":"自然语言指令已停用"}'
+        try:
+            self.ensure_access(event)
+        except CapabilityError as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
         if not isinstance(arguments, dict):
             return '{"error":"参数必须是对象"}'
         if self.dirty:
@@ -586,7 +686,11 @@ class CapabilityBridge(Star):
         if cache is None:
             cache = {}
             event.set_extra("capability_bridge_runs", cache)
-        key = capability_id + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        key = (
+            self.controls_token(self.settings())
+            + capability_id
+            + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
+        )
         if key in cache:
             return cache[key]
         # Cache a pending result before awaiting to prevent concurrent duplicates.
@@ -599,6 +703,10 @@ class CapabilityBridge(Star):
         self, event, capability_id, arguments, approved_snapshot=None
     ):
         """Route tool calls and human approvals through the same permission gate."""
+        try:
+            self.ensure_access(event)
+        except CapabilityError as exc:
+            return {"error": str(exc)}
         for name, adaptation in self.state["adaptations"].items():
             for cap in adaptation.get("capabilities", []):
                 if cap["id"] != capability_id or not cap.get("enabled"):
@@ -610,9 +718,7 @@ class CapabilityBridge(Star):
                         self.state, cap["id"], self.catalog[name]["fingerprint"]
                     )
                     if mode == "admin_confirm" and not event.is_admin():
-                        raise CapabilityError(
-                            "该功能仅限当前会话的 AstrBot 管理员使用，并且需要本人确认"
-                        )
+                        raise CapabilityError("该功能仅限当前会话的 AstrBot 管理员使用")
 
                     async def authorize(snapshot):
                         return await self._authorize_call(
@@ -643,13 +749,19 @@ class CapabilityBridge(Star):
 
     async def _authorize_call(self, event, cap, arguments, snapshot, approved_snapshot):
         """Authorize final arguments without trusting model-side confirmations."""
+        settings = self.ensure_access(event)
         mode, _ = call_policy(self.state, cap["id"], snapshot["fingerprint"])
         if mode == "admin_confirm" and not event.is_admin():
-            raise CapabilityError(
-                "该功能仅限当前会话的 AstrBot 管理员使用，并且需要本人确认"
-            )
-        snapshot = {**snapshot, "capability_id": cap["id"], "policy": mode}
-        if mode == "direct" and approved_snapshot is None:
+            raise CapabilityError("该功能仅限当前会话的 AstrBot 管理员使用")
+        snapshot = {
+            **snapshot,
+            "capability_id": cap["id"],
+            "policy": mode,
+            "controls_revision": self.controls_token(settings),
+        }
+        if approved_snapshot is None and (
+            mode == "direct" or not settings["confirmation_enabled"]
+        ):
             return None
         # A later confirmation message does not carry the original attachment or
         # reply. Fail closed rather than silently authorizing a different input.
@@ -721,10 +833,13 @@ class CapabilityBridge(Star):
         if not dispatched:
             yield event.plain_result("请本人在原会话直接发送确认指令，工具不能代为确认")
             return
-        if not self.config.get("enabled", True):
-            yield event.plain_result("自然语言指令已停用")
-            return
         try:
+            settings = self.ensure_access(event)
+            if not settings["confirmation_enabled"]:
+                yield event.plain_result(
+                    "二次确认已关闭，旧确认码已失效；请重新发起需求"
+                )
+                return
             pending = self.confirmations.consume(event, confirmation_code)
             await self.refresh()
             result = await self._run_capability(
@@ -741,6 +856,8 @@ class CapabilityBridge(Star):
 
     async def terminate(self):
         """Stop a running analysis job during plugin unload."""
+        self.closed = True
+        self.confirmations.items.clear()
         if self.job_task and not self.job_task.done():
             self.job_task.cancel()
             await self.job_task

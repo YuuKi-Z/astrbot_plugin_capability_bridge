@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from astrbot.api.message_components import At
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
@@ -20,6 +20,7 @@ from ..plans import validate_plan
 from ..policy import PendingCalls
 from ..runtime import CapabilityError, execute, resolve_member
 from ..scanner import _collect, fingerprint, inspect_helpers, parameter_schema
+from ..settings import read_settings, settings_revision
 
 
 class FixturePlugin:
@@ -480,6 +481,186 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         replies = [item async for item in bridge.confirm_execution(again, code)]
         self.assertIn("确认码无效", replies[0].get_plain_text())
         self.assertEqual(len(self.plugin.calls), 1)
+
+    async def test_confirmation_can_be_disabled_without_removing_admin_gate(self):
+        bridge = self.make_bridge()
+        bridge.config["confirmation_enabled"] = False
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.plugin.calls, [("111111", "Caller#1")])
+        self.assertEqual(bridge.confirmations.items, {})
+        bridge = self.make_bridge("admin_confirm")
+        bridge.config["confirmation_enabled"] = False
+        result = json.loads(
+            await bridge.capability_run(FakeEvent(), self.cap["id"], {})
+        )
+        self.assertIn("仅限", result["error"])
+        self.assertEqual(len(self.plugin.calls), 1)
+        admin = FakeEvent()
+        admin.admin = True
+        result = json.loads(await bridge.capability_run(admin, self.cap["id"], {}))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(self.plugin.calls), 2)
+
+    async def test_switching_confirmation_cancels_pending_and_old_message_retries(self):
+        bridge = self.make_bridge()
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        bridge.config["confirmation_enabled"] = False
+        bridge.settings()
+        self.assertEqual(bridge.confirmations.items, {})
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertIn("旧请求不会自动执行", result["error"])
+        event = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertIn("二次确认已关闭", replies[0].get_plain_text())
+        self.assertEqual(self.plugin.calls, [])
+        bridge.config["confirmation_enabled"] = True
+        bridge.settings()
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertIn("旧请求不会自动执行", result["error"])
+        fresh = FakeEvent()
+        result = json.loads(await bridge.capability_run(fresh, self.cap["id"], {}))
+        self.assertEqual(result["status"], "confirmation_required")
+
+    async def test_scope_blocks_tools_discovery_execution_and_confirmation(self):
+        bridge = self.make_bridge("direct")
+        bridge.config["group_blacklist"] = ["888888"]
+        for result in (
+            await bridge.capability_find(self.event, "账号报告"),
+            await bridge.capability_run(self.event, self.cap["id"], {}),
+        ):
+            self.assertIn("允许范围", json.loads(result)["error"])
+        original_tools = SimpleNamespace(
+            tools=[
+                SimpleNamespace(name="capability_find"),
+                SimpleNamespace(name="capability_run"),
+                SimpleNamespace(name="native_other"),
+            ]
+        )
+        req = SimpleNamespace(func_tool=original_tools, system_prompt="original")
+        await bridge.prepare_request(self.event, req)
+        self.assertEqual([t.name for t in req.func_tool.tools], ["native_other"])
+        self.assertEqual(len(original_tools.tools), 3)
+        self.assertEqual(req.system_prompt, "original")
+        bridge.config["group_blacklist"] = []
+        bridge = self.make_bridge()
+        await bridge.capability_run(FakeEvent(), self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        bridge.config["group_blacklist"] = ["888888"]
+        event = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertIn("允许范围", replies[0].get_plain_text())
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_scope_is_rechecked_after_async_binding_resolution(self):
+        bridge = self.make_bridge("direct")
+
+        async def block_during_lookup(user_id):
+            bridge.config["group_blacklist"] = ["888888"]
+            return "Caller#1"
+
+        self.plugin._get_account = block_during_lookup
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertIn("允许范围", result["error"])
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_execution_model_is_selected_before_build_and_only_in_allowed_scope(
+        self,
+    ):
+        bridge = self.make_bridge()
+        bridge.config["execution_provider_id"] = "configured-chat"
+        self.event.set_extra("selected_model", "old-model")
+        request = SimpleNamespace(model="old-model")
+        self.event.set_extra("provider_request", request)
+        await bridge.select_execution_model(self.event)
+        self.assertEqual(self.event.get_extra("selected_provider"), "configured-chat")
+        self.assertIsNone(self.event.get_extra("selected_model"))
+        self.assertIsNone(request.model)
+        blocked = FakeEvent()
+        blocked.set_extra("selected_provider", "original")
+        bridge.config["group_blacklist"] = ["888888"]
+        await bridge.select_execution_model(blocked)
+        self.assertEqual(blocked.get_extra("selected_provider"), "original")
+        bridge = self.make_bridge()
+        original = FakeEvent()
+        original.set_extra("selected_provider", "original")
+        await bridge.select_execution_model(original)
+        self.assertEqual(original.get_extra("selected_provider"), "original")
+
+    def test_legacy_model_migrates_once_and_clearing_it_survives_reload(self):
+        class NativeConfig(dict):
+            def save_config(self):
+                pass
+
+        data = Path(self.temp.name)
+        target = data / "astrbot_plugin_capability_bridge" / "state.json"
+        target.parent.mkdir()
+        target.write_text(
+            json.dumps(
+                {"settings": {"provider_id": "legacy-analysis"}, "adaptations": {}}
+            )
+        )
+        config = NativeConfig(read_settings({}))
+        context = SimpleNamespace(register_web_api=Mock())
+        with patch(
+            "astrbot_plugin_capability_bridge.main.get_astrbot_plugin_data_path",
+            return_value=str(data),
+        ):
+            first = CapabilityBridge(context, config)
+            self.assertEqual(
+                first.settings()["analysis_provider_id"], "legacy-analysis"
+            )
+            config["analysis_provider_id"] = ""
+            second = CapabilityBridge(context, config)
+            self.assertEqual(second.settings()["analysis_provider_id"], "")
+
+    async def test_settings_api_writes_native_config_and_rejects_stale_or_invalid_updates(
+        self,
+    ):
+        class NativeConfig(dict):
+            def save_config(self):
+                self.saved = dict(self)
+
+        bridge = self.make_bridge()
+        bridge.config = NativeConfig(read_settings({"group_blacklist": ["blocked"]}))
+        bridge.context.get_all_providers = lambda: [
+            SimpleNamespace(meta=lambda: SimpleNamespace(id="analysis-two"))
+        ]
+        revision = settings_revision(bridge.settings())
+        payload = {"analysis_provider_id": "analysis-two", "revision": revision}
+        incoming = SimpleNamespace(
+            username="admin", json=AsyncMock(return_value=payload)
+        )
+        with (
+            patch("astrbot_plugin_capability_bridge.main.request", incoming),
+            patch(
+                "astrbot_plugin_capability_bridge.main.json_response",
+                side_effect=lambda value: value,
+            ),
+            patch(
+                "astrbot_plugin_capability_bridge.main.error_response",
+                side_effect=lambda message, **kw: {"error": message, **kw},
+            ),
+        ):
+            result = await bridge.api_settings()
+            self.assertTrue(result["saved"])
+            self.assertEqual(
+                bridge.config.saved["analysis_provider_id"], "analysis-two"
+            )
+            self.assertEqual(bridge.config.saved["group_blacklist"], ["blocked"])
+            incoming.json = AsyncMock(
+                return_value={"confirmation_enabled": False, "revision": revision}
+            )
+            result = await bridge.api_settings()
+            self.assertEqual(result["status_code"], 409)
+            self.assertTrue(bridge.config["confirmation_enabled"])
+            incoming.json = AsyncMock(return_value={"confirmation_enabled": "false"})
+            result = await bridge.api_settings()
+            self.assertIn("必须是开关", result["error"])
+            incoming.username = None
+            result = await bridge.api_settings()
+            self.assertEqual(result["status_code"], 401)
 
     async def test_model_or_executor_cannot_confirm_a_pending_call(self):
         bridge = self.make_bridge()
