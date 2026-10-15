@@ -153,6 +153,7 @@ async def execute(
     record: dict,
     arguments: dict,
     expected_fingerprint: str,
+    before_execute=None,
 ) -> dict:
     """Run a validated mapping, preserving binding targets and native output.
 
@@ -163,6 +164,7 @@ async def execute(
         record: Current scanned plugin interfaces.
         arguments: User arguments checked against the generated schema.
         expected_fingerprint: Source version used to generate this adaptation.
+        before_execute: Optional gate receiving the final command and arguments.
 
     Returns:
         A bounded result for the chat model; native messages are delivered once.
@@ -209,42 +211,9 @@ async def execute(
         tail_text = values.get(message_tail["input"], "")
         if not isinstance(tail_text, str) or len(tail_text) > 8000:
             raise CapabilityError("消息尾部参数必须是不超过 8000 字符的文字")
-    proxy = copy.copy(event)
-    proxy._extras = dict(event.get_extra() or {})
-    proxy._result = None
-    proxy._has_send_oper = False
-    proxy.message_obj = copy.copy(event.message_obj)
-    proxy.message_str = (
-        entry["command"]
-        + " "
-        + (
-            tail_text
-            if tail_text is not None
-            else " ".join(
-                str(params[k])
-                for k in entry["parameters"]
-                if k in params and params[k] is not None
-            )
-        )
-    ).rstrip()
-    proxy.message_obj.message_str = proxy.message_str
-    proxy.message_obj.message = [Plain(text=proxy.message_str)] + [
-        c for c in event.get_messages() if not isinstance(c, Plain)
-    ]
-    proxy.is_at_or_wake_command = True
-    proxy.set_extra("parsed_params", params)
-    config = context.get_config(umo=event.unified_msg_origin)
-    for registered in [*entry.get("parents", []), entry["handler"]]:
-        for rule in registered.event_filters:
-            if isinstance(rule, (CommandFilter, CommandGroupFilter)):
-                if not rule.custom_filter_ok(proxy, config):
-                    raise CapabilityError("原指令的使用条件未满足")
-            elif not isinstance(rule, PermissionTypeFilter) and not rule.filter(
-                proxy, config
-            ):
-                raise CapabilityError("当前平台或消息未满足原插件的使用条件")
     binding = capability.get("subject_binding")
     subject = None
+    missing_binding = None
     if binding and not params.get(binding["target_parameter"]):
         subject = await resolve_member(event, values.get(binding["input"], "我"))
         helper = record["helpers"].get(binding["lookup_method"], {})
@@ -263,16 +232,11 @@ async def execute(
                 else f"查询对象：{subject['name']}\n"
             )
             text = prefix + str(message)[:2000]
-            await event.send(MessageChain().message(text))
-            return {
-                "status": "missing_binding",
-                "delivered": True,
-                "text": text,
-                "do_not_repeat": True,
-            }
-        if not isinstance(account, (str, int)) or len(str(account)) > 512:
+            missing_binding = text
+        elif not isinstance(account, (str, int)) or len(str(account)) > 512:
             raise CapabilityError("绑定接口返回了不支持的账号格式")
-        params[binding["target_parameter"]] = str(account)
+        else:
+            params[binding["target_parameter"]] = str(account)
     for name, value in params.items():
         kind = entry["parameters"][name]["type"]
         if value is None and "None" in entry["parameters"][name]["annotation"]:
@@ -297,8 +261,21 @@ async def execute(
             raise CapabilityError(f"原指令参数 {name} 的类型应为 {kind}")
     for name, info in entry["parameters"].items():
         if info["required"] and name not in params:
+            if missing_binding is not None and name == binding["target_parameter"]:
+                continue
             raise CapabilityError(f"缺少原指令所需参数：{name}")
-    proxy.set_extra("parsed_params", params)
+    proxy = copy.copy(event)
+    proxy._extras = dict(event.get_extra() or {})
+    proxy._result = None
+    proxy._force_stopped = False
+    proxy._has_send_oper = False
+    proxy.message_obj = copy.copy(event.message_obj)
+    if getattr(event.message_obj, "sender", None) is not None:
+        proxy.message_obj.sender = copy.copy(event.message_obj.sender)
+    if isinstance(getattr(event.message_obj, "raw_message", None), dict):
+        proxy.message_obj.raw_message = copy.deepcopy(event.message_obj.raw_message)
+    proxy.is_at_or_wake_command = True
+    proxy.set_extra("parsed_params", copy.deepcopy(params))
     proxy.message_str = (
         entry["command"]
         + " "
@@ -316,6 +293,39 @@ async def execute(
     proxy.message_obj.message = [Plain(text=proxy.message_str)] + [
         c for c in event.get_messages() if not isinstance(c, Plain)
     ]
+    # Resolve all arguments before running filters, once, on the final event.
+    # Recheck live permissions after binding lookups, which can await network I/O.
+    await check_access(context, event, record, entry)
+    config = context.get_config(umo=event.unified_msg_origin)
+    for registered in [*entry.get("parents", []), entry["handler"]]:
+        for rule in registered.event_filters:
+            if isinstance(rule, (CommandFilter, CommandGroupFilter)):
+                if not rule.custom_filter_ok(proxy, config):
+                    raise CapabilityError("原指令的使用条件未满足")
+            elif not isinstance(rule, PermissionTypeFilter) and not rule.filter(
+                proxy, config
+            ):
+                raise CapabilityError("当前平台或消息未满足原插件的使用条件")
+    if missing_binding is not None:
+        await event.send(MessageChain().message(missing_binding))
+        return {
+            "status": "missing_binding",
+            "delivered": True,
+            "text": missing_binding,
+            "do_not_repeat": True,
+        }
+    if before_execute is not None:
+        decision = await before_execute(
+            {
+                "command_id": capability["command_id"],
+                "command": entry["command"],
+                "fingerprint": expected_fingerprint,
+                "parameters": copy.deepcopy(params),
+                "message_tail": tail_text,
+            }
+        )
+        if decision is not None:
+            return decision
     result = entry["handler"].handler(proxy, **params)
     texts = []
     sent = 0

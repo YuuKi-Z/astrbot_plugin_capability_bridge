@@ -28,3 +28,7 @@ jobs:
         run: python -m ruff format --check .
       - name: Compile source
         run: python -m compileall -q .
+      - name: Check approval boundaries
+        env:
+          PYTHONPATH: ..
+        run: python -m unittest astrbot_plugin_capability_bridge.tests.test_policy -v

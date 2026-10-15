@@ -1,6 +1,7 @@
 """Behavioral checks using real AstrBot filters and in-memory plugin fixtures."""
 
 import copy
+import functools
 import json
 import tempfile
 import unittest
@@ -8,12 +9,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from astrbot.api.message_components import At
 from astrbot.core.message.message_event_result import MessageChain, MessageEventResult
 from astrbot.core.star.filter.command import CommandFilter
+from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
 
 from ..main import CapabilityBridge
 from ..plans import validate_plan
+from ..policy import PendingCalls
 from ..runtime import CapabilityError, execute, resolve_member
 from ..scanner import _collect, fingerprint, inspect_helpers, parameter_schema
 
@@ -103,6 +107,12 @@ class FakeEvent:
 
     def clear_result(self):
         self._result = None
+
+    def stop_event(self):
+        self.stopped = True
+
+    def plain_result(self, text):
+        return MessageEventResult().message(text)
 
     async def send(self, chain):
         self.sent.append(chain.get_plain_text())
@@ -280,14 +290,285 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         bridge.dirty = False
         bridge.catalog = {"fixture": self.record}
         bridge.state = {
+            "policies": {
+                self.cap["id"]: {"mode": "direct", "fingerprint": self.digest}
+            },
             "adaptations": {
                 "fixture": {"fingerprint": self.digest, "capabilities": [self.cap]}
-            }
+            },
         }
         a = await bridge.capability_run(self.event, self.cap["id"], {})
         b = await bridge.capability_run(self.event, self.cap["id"], {})
         self.assertEqual(a, b)
         self.assertEqual(len(self.plugin.calls), 1)
+
+    def make_bridge(self, mode=None):
+        bridge = object.__new__(CapabilityBridge)
+        bridge.context = self.context
+        bridge.config = {"enabled": True}
+        bridge.dirty = False
+        bridge.catalog = {"fixture": self.record}
+        bridge.state = {
+            "adaptations": {
+                "fixture": {"fingerprint": self.digest, "capabilities": [self.cap]}
+            },
+            "policies": {},
+        }
+        if mode:
+            bridge.state["policies"][self.cap["id"]] = {
+                "mode": mode,
+                "fingerprint": self.digest,
+            }
+        bridge.confirmations = PendingCalls()
+        bridge.refresh = AsyncMock()
+        return bridge
+
+    def confirmation_event(self, bridge, code):
+        event = FakeEvent()
+        event.set_extra(
+            "activated_handlers",
+            [
+                SimpleNamespace(
+                    handler_name="confirm_execution",
+                    handler=bridge.confirm_execution,
+                    handler_full_name="fixture_confirm_execution",
+                )
+            ],
+        )
+        event.set_extra(
+            "handlers_parsed_params",
+            {"fixture_confirm_execution": {"confirmation_code": code}},
+        )
+        return event
+
+    async def test_final_target_account_is_checked_before_execution(self):
+        observed = []
+
+        def restrict_target(event, config):
+            account = event.get_extra("parsed_params", {}).get("account")
+            observed.append((account, event.message_str))
+            return account != "Target#2"
+
+        self.record["commands"]["fixture.report"]["handler"].event_filters.append(
+            SimpleNamespace(filter=restrict_target)
+        )
+        with self.assertRaises(CapabilityError):
+            await execute(
+                self.context,
+                self.event,
+                self.cap,
+                self.record,
+                {"target_user": "小二"},
+                self.digest,
+            )
+        self.assertEqual(observed, [("Target#2", "account report Target#2")])
+        self.assertEqual(self.plugin.calls, [])
+        self.assertEqual(self.event.sent, [])
+
+    async def test_permissions_rechecked_after_binding_lookup(self):
+        self.event.admin = True
+        self.record["commands"]["fixture.report"]["parents"] = [
+            SimpleNamespace(
+                enabled=True, event_filters=[PermissionTypeFilter(PermissionType.ADMIN)]
+            )
+        ]
+
+        async def revoke_during_lookup(user_id):
+            self.event.admin = False
+            return "Target#2"
+
+        self.plugin._get_account = revoke_during_lookup
+        with self.assertRaises(CapabilityError):
+            await execute(
+                self.context,
+                self.event,
+                self.cap,
+                self.record,
+                {"target_user": "小二"},
+                self.digest,
+            )
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_parent_custom_filter_runs_once_with_final_parameters(self):
+        observed = []
+
+        def restrict_target(event, config):
+            observed.append(event.get_extra("parsed_params")["account"])
+            return False
+
+        group = CommandGroupFilter("account")
+        group.add_custom_filter(SimpleNamespace(filter=restrict_target))
+        self.record["commands"]["fixture.report"]["parents"] = [
+            SimpleNamespace(enabled=True, event_filters=[group])
+        ]
+        with self.assertRaises(CapabilityError):
+            await execute(
+                self.context,
+                self.event,
+                self.cap,
+                self.record,
+                {"target_user": "小二"},
+                self.digest,
+            )
+        self.assertEqual(observed, ["Target#2"])
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_confirmation_accepts_framework_partial_and_command_parser(self):
+        bridge = self.make_bridge()
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        event = FakeEvent()
+        event.is_at_or_wake_command = True
+        event.message_str = "确认执行 " + code
+        command_filter = CommandFilter("确认执行")
+        command_filter.init_handler_md(
+            SimpleNamespace(handler=CapabilityBridge.confirm_execution)
+        )
+        self.assertTrue(command_filter.filter(event, {}))
+        parsed = event.get_extra("parsed_params")
+        event.set_extra(
+            "activated_handlers",
+            [
+                SimpleNamespace(
+                    handler_name="confirm_execution",
+                    handler=functools.partial(
+                        CapabilityBridge.confirm_execution, bridge
+                    ),
+                    handler_full_name="fixture_confirm_execution",
+                )
+            ],
+        )
+        event.set_extra("handlers_parsed_params", {"fixture_confirm_execution": parsed})
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertEqual(replies, [])
+        self.assertEqual(self.plugin.calls, [("111111", "Caller#1")])
+
+    async def test_confirmation_does_not_inherit_event_stop_into_original_handler(self):
+        bridge = self.make_bridge()
+        observed = []
+
+        async def report(event, account=None):
+            observed.append(event._force_stopped)
+
+        self.record["commands"]["fixture.report"]["handler"].handler = report
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        event = self.confirmation_event(bridge, code)
+        event._force_stopped = True
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertEqual(replies[0].get_plain_text(), "操作已执行")
+        self.assertEqual(observed, [False])
+        self.assertTrue(event._force_stopped)
+
+    async def test_unreviewed_call_waits_for_actual_human_confirmation(self):
+        bridge = self.make_bridge()
+        result = json.loads(
+            await bridge.capability_run(
+                self.event, self.cap["id"], {"target_user": "小二"}
+            )
+        )
+        self.assertEqual(result["status"], "confirmation_required")
+        self.assertEqual(self.plugin.calls, [])
+        self.assertIn("Target#2", self.event.sent[0])
+        code = next(iter(bridge.confirmations.items))
+        event = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertEqual(replies, [])
+        self.assertEqual(self.plugin.calls, [("111111", "Target#2")])
+        self.assertTrue(event.stopped)
+        again = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(again, code)]
+        self.assertIn("确认码无效", replies[0].get_plain_text())
+        self.assertEqual(len(self.plugin.calls), 1)
+
+    async def test_model_or_executor_cannot_confirm_a_pending_call(self):
+        bridge = self.make_bridge()
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        forged = FakeEvent()
+        forged.message_str = "确认执行 " + code
+        replies = [item async for item in bridge.confirm_execution(forged, code)]
+        self.assertIn("工具不能代为确认", replies[0].get_plain_text())
+        self.assertIn(code, bridge.confirmations.items)
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_confirmation_rejects_changed_final_account(self):
+        bridge = self.make_bridge()
+        await bridge.capability_run(self.event, self.cap["id"], {"target_user": "小二"})
+        code = next(iter(bridge.confirmations.items))
+        self.plugin.bindings["222222"] = "Changed#3"
+        event = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertIn("已经变化", replies[0].get_plain_text())
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_confirmation_does_not_silently_replace_message_context(self):
+        bridge = self.make_bridge()
+        self.event.message_obj.message = [At(qq="222222")]
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertIn("消息对象", result["error"])
+        self.assertEqual(bridge.confirmations.items, {})
+        self.assertEqual(self.plugin.calls, [])
+        self.event = FakeEvent()
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        event = self.confirmation_event(bridge, code)
+        event.message_obj.message = [At(qq="222222")]
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertIn("消息对象", replies[0].get_plain_text())
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_confirmation_rechecks_original_permissions(self):
+        bridge = self.make_bridge()
+        self.event.admin = True
+        self.record["commands"]["fixture.report"]["parents"] = [
+            SimpleNamespace(
+                enabled=True, event_filters=[PermissionTypeFilter(PermissionType.ADMIN)]
+            )
+        ]
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        event = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertIn("权限不足", replies[0].get_plain_text())
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_admin_policy_cannot_be_bypassed_by_known_capability_id(self):
+        bridge = self.make_bridge("admin_confirm")
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertIn("仅限", result["error"])
+        self.assertEqual(bridge.confirmations.items, {})
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_direct_policy_keeps_original_admin_permission(self):
+        bridge = self.make_bridge("direct")
+        self.record["commands"]["fixture.report"]["parents"] = [
+            SimpleNamespace(
+                enabled=True, event_filters=[PermissionTypeFilter(PermissionType.ADMIN)]
+            )
+        ]
+        result = json.loads(await bridge.capability_run(self.event, self.cap["id"], {}))
+        self.assertIn("权限不足", result["error"])
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_changed_call_policy_invalidates_pending_confirmation(self):
+        bridge = self.make_bridge()
+        await bridge.capability_run(self.event, self.cap["id"], {})
+        code = next(iter(bridge.confirmations.items))
+        bridge.state["policies"][self.cap["id"]] = {
+            "mode": "direct",
+            "fingerprint": self.digest,
+        }
+        event = self.confirmation_event(bridge, code)
+        replies = [item async for item in bridge.confirm_execution(event, code)]
+        self.assertIn("已经变化", replies[0].get_plain_text())
+        self.assertEqual(self.plugin.calls, [])
+
+    def test_model_cannot_set_call_policy_in_adaptation(self):
+        raw = copy.deepcopy(self.raw)
+        raw["call_policy"] = "direct"
+        with self.assertRaises(ValueError):
+            validate_plan(raw, self.record)
 
     def test_reject_invented_mapping_and_mutating_helpers(self):
         self.assertNotIn("_unsafe_hint", self.record["helpers"])

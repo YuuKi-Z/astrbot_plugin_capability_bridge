@@ -1,6 +1,7 @@
 """Discover plugin interfaces, generate cached mappings, and expose two tools."""
 
 import asyncio
+import functools
 import json
 import math
 import re
@@ -9,18 +10,23 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import At, Plain
 from astrbot.api.star import Context, Star
 from astrbot.api.web import error_response, json_response, request
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from jsonschema.exceptions import SchemaError
 
 from .plans import parse_response, validate_plan
+from .policy import POLICY_MODES, PendingCalls, call_policy
 from .prompts import ANALYZE_PROMPT
 from .runtime import CapabilityError, check_access, execute
 from .scanner import PLUGIN_NAME, analysis_document, scan
 
 BRIDGE_INSTRUCTION = """\n[CAPABILITY_BRIDGE]
 用户明确请求执行某个功能时，主动判断并调用可用工具。需要查找插件功能时先调用 capability_find，按返回的参数说明调用 capability_run；原生工具直接用其原名调用。不把‘能不能帮我查/生成’仅回答成能力介绍。缺少必要信息才追问。能力不存在或未适配要如实说明，不能编造已执行。target_user 必须来自用户的明确指代，查别人不能替换成自己。工具返回 delivered/do_not_repeat 表示原插件已发送结果，不重复转述整份结果。\n"""
+
+BRIDGE_INSTRUCTION += "返回 confirmation_required 表示尚未执行，必须由请求者在原会话发送提示中的确认指令；不能代替用户确认，也不能改用其他工具绕过。\n"
 
 
 ANALYSIS_SOURCE_LIMIT = 48000
@@ -40,6 +46,7 @@ class CapabilityBridge(Star):
         self.state = {
             "settings": {"provider_id": ""},
             "adaptations": {},
+            "policies": {},
         }
         if self.state_path.exists():
             try:
@@ -48,12 +55,15 @@ class CapabilityBridge(Star):
                     "provider_id", ""
                 )
                 self.state["adaptations"] = loaded.get("adaptations", {})
+                if isinstance(loaded.get("policies"), dict):
+                    self.state["policies"] = loaded["policies"]
             except (OSError, ValueError):
                 logger.warning("Capability bridge state could not be loaded")
         self.catalog = {}
         self.dirty = True
         self.scan_lock = asyncio.Lock()
         self.job_task = None
+        self.confirmations = PendingCalls()
         self.job = {"status": "idle", "items": [], "tokens": 0, "estimated_tokens": 0}
         for path, handler, methods in [
             ("status", self.api_status, ["GET"]),
@@ -62,6 +72,7 @@ class CapabilityBridge(Star):
             ("adapt", self.api_adapt, ["POST"]),
             ("cancel", self.api_cancel, ["POST"]),
             ("toggle", self.api_toggle, ["POST"]),
+            ("policy", self.api_policy, ["POST"]),
         ]:
             context.register_web_api(
                 f"/{PLUGIN_NAME}/{path}", handler, methods, "Capability bridge " + path
@@ -125,11 +136,23 @@ class CapabilityBridge(Star):
                     "name": name,
                     "display_name": record["display_name"],
                     "version": record["version"],
+                    "fingerprint": record["fingerprint"],
                     "active": record["active"],
                     "state": state,
                     "command_count": len(record["commands"]),
                     "native_tools": record["native_tools"],
-                    "capabilities": caps,
+                    "capabilities": [
+                        {
+                            **cap,
+                            "call_policy": call_policy(
+                                self.state, cap["id"], record["fingerprint"]
+                            )[0],
+                            "policy_reviewed": call_policy(
+                                self.state, cap["id"], record["fingerprint"]
+                            )[1],
+                        }
+                        for cap in caps
+                    ],
                     "unsupported": list(
                         {
                             u["command_id"]: u
@@ -410,6 +433,40 @@ class CapabilityBridge(Star):
                     return json_response({"saved": True})
         return error_response("能力不存在", status_code=404)
 
+    async def api_policy(self):
+        """Save an administrator's call policy for the exact scanned source."""
+        if not request.username:
+            return error_response("需要登录管理后台", status_code=401)
+        data = await request.json(default={})
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("mode"), str)
+            or data["mode"] not in POLICY_MODES
+        ):
+            return error_response("调用方式无效")
+        await self.refresh()
+        for name, adaptation in self.state["adaptations"].items():
+            record = self.catalog.get(name)
+            if not record:
+                continue
+            for cap in adaptation.get("capabilities", []):
+                if cap["id"] != data.get("id"):
+                    continue
+                if (
+                    data.get("fingerprint") != record["fingerprint"]
+                    or adaptation.get("fingerprint") != record["fingerprint"]
+                ):
+                    return error_response(
+                        "插件已变化，请刷新并重新适配后再设置", status_code=409
+                    )
+                self.state.setdefault("policies", {})[cap["id"]] = {
+                    "mode": data["mode"],
+                    "fingerprint": record["fingerprint"],
+                }
+                self.save()
+                return json_response({"saved": True})
+        return error_response("能力不存在", status_code=404)
+
     @filter.on_llm_request(priority=-20000)
     async def prepare_request(self, event: AstrMessageEvent, req):
         """Attach a compact instruction after other plugins assemble tools."""
@@ -464,6 +521,11 @@ class CapabilityBridge(Star):
                     await check_access(self.context, event, record, entry)
                 except CapabilityError:
                     continue
+                mode, reviewed = call_policy(
+                    self.state, cap["id"], record["fingerprint"]
+                )
+                if mode == "admin_confirm" and not event.is_admin():
+                    continue
                 text = (
                     cap["name"] + cap["description"] + name + " ".join(cap["examples"])
                 ).casefold()
@@ -481,7 +543,12 @@ class CapabilityBridge(Star):
                                 "permission",
                             ]
                         }
-                        | {"kind": "adapted", "execute_with": "capability_run"},
+                        | {
+                            "kind": "adapted",
+                            "execute_with": "capability_run",
+                            "call_policy": mode,
+                            "policy_reviewed": reviewed,
+                        },
                     )
                 )
         for tool in event.get_extra("capability_bridge_native", []):
@@ -511,6 +578,8 @@ class CapabilityBridge(Star):
         """
         if not self.config.get("enabled", True):
             return '{"error":"自然语言指令已停用"}'
+        if not isinstance(arguments, dict):
+            return '{"error":"参数必须是对象"}'
         if self.dirty:
             await self.refresh()
         cache = event.get_extra("capability_bridge_runs", None)
@@ -520,6 +589,16 @@ class CapabilityBridge(Star):
         key = capability_id + json.dumps(arguments, sort_keys=True, ensure_ascii=False)
         if key in cache:
             return cache[key]
+        # Cache a pending result before awaiting to prevent concurrent duplicates.
+        cache[key] = '{"status":"already_started","do_not_repeat":true}'
+        result = await self._run_capability(event, capability_id, arguments)
+        cache[key] = json.dumps(result, ensure_ascii=False)
+        return cache[key]
+
+    async def _run_capability(
+        self, event, capability_id, arguments, approved_snapshot=None
+    ):
+        """Route tool calls and human approvals through the same permission gate."""
         for name, adaptation in self.state["adaptations"].items():
             for cap in adaptation.get("capabilities", []):
                 if cap["id"] != capability_id or not cap.get("enabled"):
@@ -527,8 +606,19 @@ class CapabilityBridge(Star):
                 try:
                     if name not in self.catalog:
                         raise CapabilityError("原插件已卸载")
-                    # Cache a pending result before awaiting to prevent concurrent duplicates.
-                    cache[key] = '{"status":"already_started","do_not_repeat":true}'
+                    mode, _ = call_policy(
+                        self.state, cap["id"], self.catalog[name]["fingerprint"]
+                    )
+                    if mode == "admin_confirm" and not event.is_admin():
+                        raise CapabilityError(
+                            "该功能仅限当前会话的 AstrBot 管理员使用，并且需要本人确认"
+                        )
+
+                    async def authorize(snapshot):
+                        return await self._authorize_call(
+                            event, cap, arguments, snapshot, approved_snapshot
+                        )
+
                     result = await execute(
                         self.context,
                         event,
@@ -536,6 +626,7 @@ class CapabilityBridge(Star):
                         self.catalog[name],
                         arguments,
                         adaptation["fingerprint"],
+                        before_execute=authorize,
                     )
                 except CapabilityError as exc:
                     result = {"error": str(exc)}
@@ -547,9 +638,106 @@ class CapabilityBridge(Star):
                         "error": "原插件执行失败或超时，请稍后重试",
                         "do_not_retry_automatically": True,
                     }
-                cache[key] = json.dumps(result, ensure_ascii=False)
-                return cache[key]
-        return '{"error":"能力不存在、已停用或尚未适配，请先查找可用能力"}'
+                return result
+        return {"error": "能力不存在、已停用或尚未适配，请先查找可用能力"}
+
+    async def _authorize_call(self, event, cap, arguments, snapshot, approved_snapshot):
+        """Authorize final arguments without trusting model-side confirmations."""
+        mode, _ = call_policy(self.state, cap["id"], snapshot["fingerprint"])
+        if mode == "admin_confirm" and not event.is_admin():
+            raise CapabilityError(
+                "该功能仅限当前会话的 AstrBot 管理员使用，并且需要本人确认"
+            )
+        snapshot = {**snapshot, "capability_id": cap["id"], "policy": mode}
+        if mode == "direct" and approved_snapshot is None:
+            return None
+        # A later confirmation message does not carry the original attachment or
+        # reply. Fail closed rather than silently authorizing a different input.
+        self_id = str(getattr(event, "get_self_id", lambda: "")())
+        if any(
+            not isinstance(component, Plain)
+            and not (isinstance(component, At) and str(component.qq) == self_id)
+            for component in event.get_messages()
+        ):
+            raise CapabilityError(
+                "此操作依赖图片、引用或其他消息对象，暂不支持确认后执行；"
+                "请使用原插件指令，或由管理员审阅后调整调用方式"
+            )
+        if approved_snapshot is not None:
+            if snapshot != approved_snapshot:
+                raise CapabilityError(
+                    "操作参数或调用方式已经变化，请重新发起请求并确认"
+                )
+            return None
+        preview = {**snapshot["parameters"]}
+        if snapshot["message_tail"] is not None:
+            preview["消息正文"] = snapshot["message_tail"]
+        text = json.dumps(preview, ensure_ascii=False, indent=2, allow_nan=False)
+        if len(text) > 3000:
+            raise CapabilityError(
+                "操作参数过长，无法完整展示确认内容，请使用原插件指令"
+            )
+        code = self.confirmations.request(event, cap["id"], arguments, snapshot)
+        message = (
+            f"待确认：{cap['name']}\n原指令：{snapshot['command']}\n"
+            f"最终参数：\n{text}\n\n尚未执行。确认无误后，请本人在本会话发送：\n"
+            f"/确认执行 {code}\n确认码两分钟内有效，仅可使用一次。"
+        )
+        await event.send(MessageChain().message(message))
+        return {
+            "status": "confirmation_required",
+            "delivered": True,
+            "do_not_repeat": True,
+            "message": "尚未执行，已向请求者发送最终参数及确认方式，等待本人确认。",
+        }
+
+    @filter.command("确认执行")
+    async def confirm_execution(self, event: AstrMessageEvent, confirmation_code: str):
+        """Execute one incoming, caller-bound confirmation through normal checks."""
+        event.stop_event()
+        # Require the framework's original command dispatch proof. A model or a
+        # generic command executor calling this method cannot manufacture consent.
+        dispatched = any(
+            h.handler_name == "confirm_execution"
+            and (
+                (
+                    getattr(h.handler, "__self__", None) is self
+                    and getattr(h.handler, "__func__", None)
+                    is type(self).confirm_execution
+                )
+                or (
+                    isinstance(h.handler, functools.partial)
+                    and h.handler.args
+                    and h.handler.args[0] is self
+                    and h.handler.func is type(self).confirm_execution
+                )
+            )
+            and event.get_extra("handlers_parsed_params", {})
+            .get(h.handler_full_name, {})
+            .get("confirmation_code")
+            == confirmation_code
+            for h in event.get_extra("activated_handlers", [])
+        )
+        if not dispatched:
+            yield event.plain_result("请本人在原会话直接发送确认指令，工具不能代为确认")
+            return
+        if not self.config.get("enabled", True):
+            yield event.plain_result("自然语言指令已停用")
+            return
+        try:
+            pending = self.confirmations.consume(event, confirmation_code)
+            await self.refresh()
+            result = await self._run_capability(
+                event,
+                pending["capability_id"],
+                pending["arguments"],
+                approved_snapshot=pending["snapshot"],
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+        if not result.get("delivered"):
+            yield event.plain_result(result.get("error") or "操作已执行")
 
     async def terminate(self):
         """Stop a running analysis job during plugin unload."""

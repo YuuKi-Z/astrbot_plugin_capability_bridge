@@ -5,6 +5,7 @@ let settingsLoaded = false;
 let busy = false;
 let serialized = "";
 const labels = {ready:'已适配',native:'原生工具',passive:'自动行为',new:'待分析',stale:'需要重新适配',disabled:'插件停用',unsupported:'暂无可用适配',queued:'等待中',analyzing:'分析中',completed:'已完成',failed:'失败',cancelled:'已停止'};
+const policyLabels = {confirm:'需本人确认',direct:'直接调用',admin_confirm:'仅管理员且需确认'};
 function node(tag, text, className) { const e=document.createElement(tag); if(text!==undefined)e.textContent=text; if(className)e.className=className; return e; }
 function notice(text, error=false) { $('notice').hidden=false; $('notice').textContent=text; $('notice').className=error?'error':''; }
 async function action(endpoint, body={}, message='已完成') {
@@ -48,11 +49,16 @@ function render() {
     if(p.capabilities.length||p.native_tools.length||p.unsupported.length||p.error){
       const detail=node('details',undefined,'plugin-body');detail.open=opened.has(p.name);detail.append(node('summary',`查看能力与适配详情${p.tokens?` · 上次 ${p.tokens.toLocaleString()} tokens`:''}`));
       if(p.state==='stale')detail.append(node('p','插件源码已更新，以下旧规则暂停使用。重新适配后恢复。','small'));
-      if(p.native_tools.length)detail.append(node('p',`可直接调用的原生工具：${p.native_tools.join('、')}`,'small'));
+      if(p.native_tools.length)detail.append(node('p',`原生工具（沿用 AstrBot 与原插件的调用控制）：${p.native_tools.join('、')}`,'small'));
       for(const cap of p.capabilities){
         const row=node('div',undefined,'cap'), info=node('div',undefined,'cap-info');info.append(node('h4',cap.name),node('p',cap.description));
         if(cap.examples.length)info.append(node('p',`试着说：${cap.examples[0]}`,'example'));
-        const toggle=node('button',cap.enabled?'已启用 · 点击停用':'已停用 · 点击启用');toggle.onclick=()=>action('toggle',{id:cap.id,enabled:!cap.enabled},'能力开关已保存');row.append(info,toggle);detail.append(row);
+        if(!cap.policy_reviewed)info.append(node('p','尚未审阅调用方式，默认需本人确认。','small'));
+        const controls=node('div',undefined,'cap-actions'),policy=node('select');policy.setAttribute('aria-label',`${cap.name}的调用方式`);
+        for(const [value,label] of Object.entries(policyLabels)){const option=node('option',label);option.value=value;policy.append(option);}
+        policy.value=cap.call_policy||'confirm';policy.disabled=running||p.state==='stale';
+        policy.onchange=async()=>{await action('policy',{id:cap.id,mode:policy.value,fingerprint:p.fingerprint},'调用方式已保存，原插件权限仍然有效');render();};
+        const toggle=node('button',cap.enabled?'已启用 · 点击停用':'已停用 · 点击启用');toggle.onclick=()=>action('toggle',{id:cap.id,enabled:!cap.enabled},'能力开关已保存');controls.append(policy,toggle);row.append(info,controls);detail.append(row);
       }
       if(p.unsupported.length){const skipped=node('details');skipped.append(node('summary',`${p.unsupported.length} 项未适配或校验未通过`));for(const u of p.unsupported)skipped.append(node('p',`${u.command_id.split('.').pop()}：${u.reason}`,'unsupported'));detail.append(skipped);}
       if(p.error)detail.append(node('p',p.error,'unsupported'));box.append(detail);
