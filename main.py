@@ -18,17 +18,18 @@ from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from jsonschema.exceptions import SchemaError
 
 from .analysis import checkpoint_key, estimated_tokens, generate
+from .layers import (
+    PRESENTATION_INSTRUCTION,
+    ExecutionLayer,
+    OutputBuffer,
+    attach_presentation,
+)
 from .plans import parse_response, validate_plan
 from .policy import POLICY_MODES, PendingCalls, call_policy
 from .prompts import ANALYZE_PROMPT
 from .runtime import CapabilityError, check_access, execute
 from .scanner import PLUGIN_NAME, analysis_batches, scan
 from .settings import access_error, read_settings, settings_revision, validate_update
-
-BRIDGE_INSTRUCTION = """\n[CAPABILITY_BRIDGE]
-用户明确请求执行某个功能时，主动判断并调用可用工具。需要查找插件功能时先调用 capability_find，按返回的参数说明调用 capability_run；原生工具直接用其原名调用。不把‘能不能帮我查/生成’仅回答成能力介绍。缺少必要信息才追问。能力不存在或未适配要如实说明，不能编造已执行。target_user 必须来自用户的明确指代，查别人不能替换成自己。工具返回 delivered/do_not_repeat 表示原插件已发送结果，不重复转述整份结果。\n"""
-
-BRIDGE_INSTRUCTION += "返回 confirmation_required 表示尚未执行，必须由请求者在原会话发送提示中的确认指令；不能代替用户确认，也不能改用其他工具绕过。\n"
 
 
 class CapabilityBridge(Star):
@@ -68,6 +69,7 @@ class CapabilityBridge(Star):
         self.scan_lock = asyncio.Lock()
         self.job_task = None
         self.confirmations = PendingCalls()
+        self.execution_turns = {}
         self.closed = False
         self._controls_generation = 0
         self._controls_revision = settings_revision(
@@ -608,21 +610,17 @@ class CapabilityBridge(Star):
 
     @filter.on_waiting_llm_request(priority=-20000)
     async def select_execution_model(self, event: AstrMessageEvent):
-        """Select the existing provider before AstrBot builds its local agent."""
+        """Select only the private execution model; preserve the persona model."""
         try:
             settings = self.ensure_access(event)
         except CapabilityError:
             return
         if provider_id := settings["execution_provider_id"]:
-            event.set_extra("selected_provider", provider_id)
-            event.set_extra("selected_model", None)
-            pending_request = event.get_extra("provider_request")
-            if pending_request is not None and hasattr(pending_request, "model"):
-                pending_request.model = None
+            event.set_extra("capability_bridge_execution_provider", provider_id)
 
     @filter.on_llm_request(priority=-20000)
     async def prepare_request(self, event: AstrMessageEvent, req):
-        """Attach a compact instruction after other plugins assemble tools."""
+        """Complete private execution before the normal persona request starts."""
         available = getattr(req.func_tool, "tools", []) if req.func_tool else []
         try:
             self.ensure_access(event)
@@ -648,8 +646,103 @@ class CapabilityBridge(Star):
                 if t.active and t.name not in {"capability_find", "capability_run"}
             ],
         )
-        if any(t.name == "capability_find" for t in available):
-            req.system_prompt = (req.system_prompt or "") + BRIDGE_INSTRUCTION
+        if not any(t.name == "capability_find" and t.active for t in available):
+            return
+        previous_outcome = event.get_extra("capability_bridge_outcome")
+        if previous_outcome is not None:
+            attach_presentation(req, previous_outcome)
+            return
+        output = OutputBuffer()
+        event.set_extra("capability_bridge_output", output)
+        layer = ExecutionLayer(self, event, req, output)
+        presentation = {
+            "system_prompt": req.system_prompt or "",
+            "prompt": req.prompt,
+            "provider_id": event.get_extra("selected_provider") or "",
+        }
+        # Snapshot only presentation context, never provider credentials.
+        event.set_extra("capability_bridge_presentation", presentation)
+        layer.event.set_extra("capability_bridge_presentation", presentation)
+        try:
+            if not presentation["provider_id"]:
+                presentation[
+                    "provider_id"
+                ] = await self.context.get_current_chat_provider_id(
+                    event.unified_msg_origin
+                )
+            provider_id = (
+                self.settings()["execution_provider_id"] or presentation["provider_id"]
+            )
+            turns = getattr(self, "execution_turns", {})
+            now = time.monotonic()
+            turns = {k: v for k, v in turns.items() if now - v["time"] < 600}
+            owner = (event.unified_msg_origin, str(event.get_sender_id()))
+            previous = turns.get(owner)
+            if previous and previous["controls"] != self.controls_token(
+                self.settings()
+            ):
+                previous = None
+            outcome = await layer.run(provider_id, previous and previous["task"])
+            self.ensure_access(layer.event)
+            if outcome["status"] == "needs_input":
+                turns[owner] = {
+                    "time": now,
+                    "controls": self.controls_token(self.settings()),
+                    "task": {"request": req.prompt, "outcome": outcome},
+                }
+            else:
+                turns.pop(owner, None)
+            while len(turns) > 128:
+                turns.pop(next(iter(turns)))
+            self.execution_turns = turns
+        except Exception as exc:  # noqa: BLE001 - Hand off failures without rerunning tools.
+            logger.warning("Private execution failed (%s)", type(exc).__name__)
+            outcome = {
+                "status": "error",
+                "summary": "指令判断或执行未正常完成，不能确认任务成功；不会自动重试",
+                "calls": layer.calls,
+                "plugin_output": output.texts,
+                "protected_output": bool(output.protected or output.media),
+            }
+        event.set_extra("capability_bridge_outcome", outcome)
+        output.late_present = functools.partial(
+            self.present_output, event, presentation
+        )
+        output.seal(event)
+        attach_presentation(req, outcome)
+
+    @filter.after_message_sent(priority=-20000)
+    async def deliver_attachments(self, event: AstrMessageEvent):
+        """The presentation boundary releases immutable data after the reply."""
+        output = event.get_extra("capability_bridge_output")
+        if output and not output.released:
+            await output.release(event)
+
+    async def present_output(self, event, presentation, message):
+        """Render confirmations and late plugin messages with no execution tools."""
+        text = message.get_plain_text()
+        media = [part for part in message.chain if not isinstance(part, Plain)]
+        if text:
+            try:
+                response = await self.context.llm_generate(
+                    chat_provider_id=presentation["provider_id"],
+                    prompt=json.dumps(
+                        {
+                            "request": presentation.get("prompt", ""),
+                            "plugin_output": text,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    system_prompt=presentation["system_prompt"]
+                    + PRESENTATION_INSTRUCTION,
+                    tools=None,
+                )
+                text = response.completion_text or text
+            except Exception as exc:  # noqa: BLE001 - Preserve output if the model is down.
+                logger.warning("Persona presentation failed (%s)", type(exc).__name__)
+            await event.send(MessageChain().message(text))
+        if media:
+            await event.send(MessageChain(chain=media))
 
     @filter.llm_tool(name="capability_find")
     async def capability_find(self, event: AstrMessageEvent, query: str) -> str:
@@ -862,7 +955,14 @@ class CapabilityBridge(Star):
             f"最终参数：\n{text}\n\n尚未执行。确认无误后，请本人在本会话发送：\n"
             f"/确认执行 {code}\n确认码两分钟内有效，仅可使用一次。"
         )
-        await event.send(MessageChain().message(message))
+        output = event.get_extra("capability_bridge_output")
+        if output:
+            output.protect(message)
+            self.confirmations.items[code]["presentation"] = copy.copy(
+                event.get_extra("capability_bridge_presentation", {})
+            )
+        else:
+            await event.send(MessageChain().message(message))
         return {
             "status": "confirmation_required",
             "delivered": True,
@@ -909,14 +1009,33 @@ class CapabilityBridge(Star):
                 return
             pending = self.confirmations.consume(event, confirmation_code)
             await self.refresh()
+            presentation = pending.get("presentation")
+            output = OutputBuffer() if presentation else None
+            execution_event = output.proxy(event) if output else event
             result = await self._run_capability(
-                event,
+                execution_event,
                 pending["capability_id"],
                 pending["arguments"],
                 approved_snapshot=pending["snapshot"],
             )
         except ValueError as exc:
             yield event.plain_result(str(exc))
+            return
+        if output:
+            summary = (
+                result.get("error")
+                or result.get("text")
+                or "原插件执行流程已结束，请根据实际输出说明结果"
+            )
+            if output.texts:
+                summary += "\n" + "\n".join(output.texts)
+            await self.present_output(
+                event, presentation, MessageChain().message(summary)
+            )
+            output.late_present = functools.partial(
+                self.present_output, event, presentation
+            )
+            await output.release(event)
             return
         if not result.get("delivered"):
             yield event.plain_result(result.get("error") or "操作已执行")
@@ -925,6 +1044,7 @@ class CapabilityBridge(Star):
         """Stop a running analysis job during plugin unload."""
         self.closed = True
         self.confirmations.items.clear()
+        getattr(self, "execution_turns", {}).clear()
         if self.job_task and not self.job_task.done():
             self.job_task.cancel()
             await self.job_task

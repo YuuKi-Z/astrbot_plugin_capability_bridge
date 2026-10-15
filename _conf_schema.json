@@ -24,8 +24,8 @@
     "default": 600
   },
   "execution_provider_id": {
-    "description": "对话 / 调用模型",
-    "hint": "留空沿用 AstrBot 当前模型；选择后用于允许会话中的本地 Agent 对话和工具调用。不会额外增加一轮模型请求，不切换第三方托管 Agent。",
+    "description": "指令判断 / 调用模型",
+    "hint": "用于第一层无人格的需求判断及工具调用，留空沿用当前会话模型。第二层使用 AstrBot 原有会话模型和人格负责回复。每轮增加一次判断请求，调用工具时可能多轮；仅支持本地 Agent。",
     "type": "string",
     "default": "",
     "_special": "select_provider"

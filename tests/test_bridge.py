@@ -117,6 +117,15 @@ class FakeEvent:
     def clear_result(self):
         self._result = None
 
+    def get_result(self):
+        return getattr(self, "_result", None)
+
+    def set_result(self, result):
+        self._result = result
+
+    def is_stopped(self):
+        return getattr(self, "stopped", False)
+
     def stop_event(self):
         self.stopped = True
 
@@ -573,7 +582,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("允许范围", result["error"])
         self.assertEqual(self.plugin.calls, [])
 
-    async def test_execution_model_is_selected_before_build_and_only_in_allowed_scope(
+    async def test_execution_model_is_selected_privately_and_only_in_allowed_scope(
         self,
     ):
         bridge = self.make_bridge()
@@ -582,14 +591,19 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         request = SimpleNamespace(model="old-model")
         self.event.set_extra("provider_request", request)
         await bridge.select_execution_model(self.event)
-        self.assertEqual(self.event.get_extra("selected_provider"), "configured-chat")
-        self.assertIsNone(self.event.get_extra("selected_model"))
-        self.assertIsNone(request.model)
+        self.assertEqual(
+            self.event.get_extra("capability_bridge_execution_provider"),
+            "configured-chat",
+        )
+        self.assertIsNone(self.event.get_extra("selected_provider"))
+        self.assertEqual(self.event.get_extra("selected_model"), "old-model")
+        self.assertEqual(request.model, "old-model")
         blocked = FakeEvent()
         blocked.set_extra("selected_provider", "original")
         bridge.config["group_blacklist"] = ["888888"]
         await bridge.select_execution_model(blocked)
         self.assertEqual(blocked.get_extra("selected_provider"), "original")
+        self.assertIsNone(blocked.get_extra("capability_bridge_execution_provider"))
         bridge = self.make_bridge()
         original = FakeEvent()
         original.set_extra("selected_provider", "original")
@@ -1101,13 +1115,20 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                 ]
             ),
             system_prompt="persona",
+            prompt="帮我生成一张图片",
         )
-        await bridge.prepare_request(self.event, req)
+        self.context.get_current_chat_provider_id = AsyncMock(return_value="chat")
+        with patch(
+            "astrbot_plugin_capability_bridge.main.ExecutionLayer.run",
+            AsyncMock(return_value={"status": "chat"}),
+        ):
+            await bridge.prepare_request(self.event, req)
         result = json.loads(
             await bridge.capability_find(self.event, "帮我生成一张图片")
         )
         self.assertEqual(result["matches"][0]["execute_with"], "generate_image")
         self.assertIn("CAPABILITY_BRIDGE", req.system_prompt)
+        self.assertIsNone(req.func_tool)
 
 
 if __name__ == "__main__":
