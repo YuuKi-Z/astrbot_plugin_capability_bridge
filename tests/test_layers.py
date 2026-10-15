@@ -332,6 +332,118 @@ class LayerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.event.sent, [])
         self.assertTrue(output.presentation_succeeded)
 
+    async def test_discarded_reply_does_not_dump_results_or_repeat_tools(self):
+        async def model(**kwargs):
+            await (
+                kwargs["tools"]
+                .get_tool("capability_run")
+                .handler(kwargs["event"], capability_id=self.cap["id"], arguments={})
+            )
+            return self.response("completed")
+
+        self.context.tool_loop_agent.side_effect = model
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.outcome["calls"].append(
+            {
+                "tool": "memorize_long_term_memory",
+                "results": [{"memorized": True, "id": 17}],
+            }
+        )
+        response = LLMResponse(role="assistant", completion_text="Preference saved")
+        await self.bridge.observe_presentation(self.event, response)
+        response.completion_text = ""
+        await self.bridge.guard_presentation(self.event, response)
+        await self.bridge.guard_presentation(self.event, response)
+        await self.bridge.deliver_attachments(self.event)
+        self.assertEqual(self.event.sent, [])
+        self.assertEqual(len(self.plugin.calls), 1)
+        self.assertTrue(output.released)
+
+    async def test_discarded_stream_does_not_trigger_failure_fallback(self):
+        async def streaming(generator, *args, **kwargs):
+            response = LLMResponse(role="assistant", completion_text="Preference saved")
+            await self.bridge.observe_presentation(self.event, response)
+            response.completion_text = ""
+            await self.bridge.guard_presentation(self.event, response)
+
+        self.event.send_streaming = streaming
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("Internal tool output")
+        await self.event.send_streaming(None)
+        await self.bridge.deliver_attachments(self.event)
+        self.assertEqual(self.event.sent, [])
+
+    async def test_discarded_reply_preserves_protected_outputs_and_media_once(self):
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("Internal tool output")
+        output.protect("Pending confirmation")
+        image = Image.fromURL("https://example.invalid/completed-result.png")
+        output.media.append(MessageChain(chain=[image]))
+        self.event.send = AsyncMock()
+        response = LLMResponse(role="assistant", completion_text="Preference saved")
+        await self.bridge.observe_presentation(self.event, response)
+        response.completion_text = ""
+        await self.bridge.guard_presentation(self.event, response)
+        await output.release(self.event, fallback=True)
+        await self.bridge.deliver_attachments(self.event)
+        sent = [call.args[0] for call in self.event.send.await_args_list]
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0].get_plain_text(), "Pending confirmation")
+        self.assertIs(sent[1].chain[0], image)
+
+    async def test_genuinely_empty_generation_still_preserves_tool_results(self):
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("Completed tool result")
+        response = LLMResponse(role="assistant", completion_text="")
+        await self.bridge.observe_presentation(self.event, response)
+        await self.bridge.guard_presentation(self.event, response)
+        self.assertIn("Completed tool result", self.event.sent)
+        self.assertFalse(output.presentation_succeeded)
+
+    async def test_error_response_still_uses_fallback_after_successful_snapshot(self):
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("Completed tool result")
+        response = LLMResponse(role="assistant", completion_text="Generated reply")
+        await self.bridge.observe_presentation(self.event, response)
+        response.role = "err"
+        response.completion_text = "Provider failed"
+        await self.bridge.guard_presentation(self.event, response)
+        self.assertIn("Completed tool result", self.event.sent)
+        self.assertFalse(output.presentation_succeeded)
+
+    async def test_generation_snapshot_is_reset_for_each_response(self):
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("Completed tool result")
+        await self.bridge.observe_presentation(
+            self.event, LLMResponse(role="assistant", completion_text="Generated reply")
+        )
+        response = LLMResponse(role="assistant", completion_text="")
+        await self.bridge.observe_presentation(self.event, response)
+        await self.bridge.guard_presentation(self.event, response)
+        self.assertIn("Completed tool result", self.event.sent)
+
+    async def test_stream_interruption_before_final_guard_still_preserves_results(self):
+        async def streaming(generator, *args, **kwargs):
+            await self.bridge.observe_presentation(
+                self.event,
+                LLMResponse(role="assistant", completion_text="Generated reply"),
+            )
+            raise TimeoutError("Stream interrupted during response processing")
+
+        self.event.send_streaming = streaming
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("Completed tool result")
+        with self.assertRaises(TimeoutError):
+            await self.event.send_streaming(None)
+        self.assertIn("Completed tool result", self.event.sent)
+
     async def test_empty_persona_reply_preserves_native_returned_data(self):
         await self.bridge.prepare_request(self.event, self.request())
         output = self.event.get_extra("capability_bridge_output")

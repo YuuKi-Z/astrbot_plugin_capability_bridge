@@ -91,6 +91,7 @@ class OutputBuffer:
         self.later = []
         self.late_present = None
         self.outcome = {}
+        self.presentation_generated = False
         self.presentation_succeeded = False
 
     async def capture(self, message):

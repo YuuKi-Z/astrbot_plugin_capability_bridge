@@ -719,6 +719,23 @@ class CapabilityBridge(Star):
         if output and not output.released:
             await output.release(event)
 
+    @filter.on_llm_response(priority=100000)
+    async def observe_presentation(self, event: AstrMessageEvent, response):
+        """Remember generation success before response filters can suppress text.
+
+        Args:
+            event: The current message event and its execution output buffer.
+            response: The model response before other response hooks run.
+        """
+        output = event.get_extra("capability_bridge_output")
+        if output:
+            output.presentation_generated = bool(
+                response is not None
+                and response.role == "assistant"
+                and response.completion_text
+                and response.completion_text.strip()
+            )
+
     @filter.on_llm_response(priority=-20000)
     async def guard_presentation(self, event: AstrMessageEvent, response):
         """Preserve completed tool output if the normal persona request fails."""
@@ -732,6 +749,15 @@ class CapabilityBridge(Star):
             and response.completion_text.strip()
         ):
             output.presentation_succeeded = True
+            return
+        if (
+            response is not None
+            and response.role == "assistant"
+            and output.presentation_generated
+        ):
+            # Other plugins suppressed generated text; preserve only immutable output.
+            output.presentation_succeeded = True
+            await output.release(event)
             return
         await output.release(event, fallback=True)
 
