@@ -249,6 +249,124 @@ class LayerTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(event.sent, [])
 
+    async def test_partial_success_preserves_question_and_followup_task(self):
+        async def model(**kwargs):
+            await (
+                kwargs["tools"]
+                .get_tool("capability_run")
+                .handler(kwargs["event"], capability_id=self.cap["id"], arguments={})
+            )
+            return self.response(
+                "needs_input",
+                summary="报告已查到，第二项还缺城市",
+                question="还要查询哪个城市？",
+            )
+
+        self.context.tool_loop_agent.side_effect = model
+        await self.bridge.prepare_request(self.event, self.request())
+        outcome = self.event.get_extra("capability_bridge_outcome")
+        self.assertEqual(outcome["status"], "needs_input")
+        self.assertEqual(outcome["question"], "还要查询哪个城市？")
+        self.assertEqual(len(self.plugin.calls), 1)
+        self.assertTrue(self.bridge.execution_turns)
+        await self.bridge.guard_presentation(
+            self.event, LLMResponse(role="err", completion_text="timeout")
+        )
+        self.assertIn("还需要补充信息：还要查询哪个城市？", self.event.sent)
+        self.assertEqual(len(self.plugin.calls), 1)
+
+    async def test_one_completed_step_does_not_finish_submitted_or_unavailable_work(
+        self,
+    ):
+        for status in ("submitted", "unavailable"):
+
+            async def model(**kwargs):
+                await (
+                    kwargs["tools"]
+                    .get_tool("capability_run")
+                    .handler(
+                        kwargs["event"], capability_id=self.cap["id"], arguments={}
+                    )
+                )
+                return self.response(status)
+
+            self.context.tool_loop_agent.side_effect = model
+            event = FakeEvent()
+            await self.bridge.prepare_request(event, self.request())
+            self.assertEqual(
+                event.get_extra("capability_bridge_outcome")["status"], status
+            )
+
+    async def test_persona_failure_returns_original_outputs_once_without_reexecution(
+        self,
+    ):
+        async def model(**kwargs):
+            await (
+                kwargs["tools"]
+                .get_tool("capability_run")
+                .handler(kwargs["event"], capability_id=self.cap["id"], arguments={})
+            )
+            return self.response("completed")
+
+        self.context.tool_loop_agent.side_effect = model
+        await self.bridge.prepare_request(self.event, self.request())
+        failure = LLMResponse(role="err", completion_text="provider timeout")
+        await self.bridge.guard_presentation(self.event, failure)
+        await self.bridge.guard_presentation(self.event, failure)
+        await self.bridge.deliver_attachments(self.event)
+        self.assertEqual(len(self.plugin.calls), 1)
+        self.assertEqual(
+            self.event.sent[1:], ["report: Caller#1", "native image placeholder"]
+        )
+        self.assertIn("不会自动重做", self.event.sent[0])
+
+    async def test_successful_persona_does_not_also_send_raw_text(self):
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("不应重复发送的原始结果")
+        await self.bridge.guard_presentation(
+            self.event,
+            LLMResponse(role="assistant", completion_text="人设已经说明结果"),
+        )
+        await self.bridge.deliver_attachments(self.event)
+        self.assertEqual(self.event.sent, [])
+        self.assertTrue(output.presentation_succeeded)
+
+    async def test_empty_persona_reply_preserves_native_returned_data(self):
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.outcome = {
+            "calls": [
+                {"tool": "weather", "results": [{"temperature": 23, "unit": "C"}]}
+            ]
+        }
+        await self.bridge.guard_presentation(
+            self.event, LLMResponse(role="assistant", completion_text="")
+        )
+        self.assertEqual(
+            json.loads(self.event.sent[1]), {"temperature": 23, "unit": "C"}
+        )
+
+    async def test_interrupted_stream_preserves_text_and_media_once(self):
+        async def streaming(generator, *args, **kwargs):
+            raise TimeoutError("persona stream interrupted")
+
+        self.event.send_streaming = streaming
+        await self.bridge.prepare_request(self.event, self.request())
+        output = self.event.get_extra("capability_bridge_output")
+        output.texts.append("真实查询结果：42")
+        output.media.append(
+            MessageChain(chain=[Image.fromURL("https://example.invalid/result.png")])
+        )
+        with self.assertRaises(TimeoutError):
+            await self.event.send_streaming(None)
+        self.assertEqual(self.event.sent[1], "真实查询结果：42")
+        self.assertEqual(len(self.event.sent), 3)
+        await self.bridge.guard_presentation(
+            self.event, LLMResponse(role="err", completion_text="timeout")
+        )
+        self.assertEqual(len(self.event.sent), 3)
+
     async def test_failed_lookup_cannot_fall_back_to_persona_banter(self):
         async def model(**kwargs):
             await (

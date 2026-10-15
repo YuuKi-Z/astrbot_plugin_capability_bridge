@@ -705,6 +705,7 @@ class CapabilityBridge(Star):
                 "protected_output": bool(output.protected or output.media),
             }
         event.set_extra("capability_bridge_outcome", outcome)
+        output.outcome = outcome
         output.late_present = functools.partial(
             self.present_output, event, presentation
         )
@@ -717,6 +718,22 @@ class CapabilityBridge(Star):
         output = event.get_extra("capability_bridge_output")
         if output and not output.released:
             await output.release(event)
+
+    @filter.on_llm_response(priority=-20000)
+    async def guard_presentation(self, event: AstrMessageEvent, response):
+        """Preserve completed tool output if the normal persona request fails."""
+        output = event.get_extra("capability_bridge_output")
+        if not output:
+            return
+        if (
+            response is not None
+            and response.role == "assistant"
+            and response.completion_text
+            and response.completion_text.strip()
+        ):
+            output.presentation_succeeded = True
+            return
+        await output.release(event, fallback=True)
 
     async def present_output(self, event, presentation, message):
         """Render confirmations and late plugin messages with no execution tools."""
