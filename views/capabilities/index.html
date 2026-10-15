@@ -7,7 +7,7 @@
   <nav class="page-tabs" role="tablist" aria-label="能力中心页面"><button id="tab-analysis" role="tab" aria-controls="page-analysis" aria-selected="true">分析适配</button><button id="tab-settings" role="tab" aria-controls="page-settings" aria-selected="false">设置</button></nav>
   <div id="notice" role="status" hidden></div>
   <section id="page-analysis" role="tabpanel" aria-labelledby="tab-analysis">
-  <section class="settings"><div><h2>分析模型</h2><p>按需分析新增或变化的插件，自动分批完成；日常对话复用规则。</p></div><div class="controls"><select id="provider" aria-label="分析模型"></select><button id="save">保存分析模型</button></div></section>
+  <section class="settings"><div><h2>分析模型</h2><p>按需分析新增或变化的插件，自动分批完成；日常对话复用规则。</p></div><div class="controls"><select id="provider" aria-label="分析模型"></select><label for="analysis-timeout">单批超时（秒）</label><input id="analysis-timeout" type="number" min="30" max="1800" step="1" value="600" aria-label="单批分析超时（秒）"><button id="save">保存分析设置</button></div></section>
   <section class="overview"><div><strong id="count-ready">0</strong><span>可用适配能力</span></div><div><strong id="count-native">0</strong><span>原生工具</span></div><div><strong id="count-changed">0</strong><span>待分析 / 有更新</span></div><div class="actions"><button id="scan">刷新扫描</button><button id="adapt" class="primary">一键适配变更</button></div></section>
   <section id="job" hidden><div class="job-head"><h2 id="job-title">适配任务</h2><button id="cancel">停止剩余分析</button></div><progress id="progress" max="1" value="0"></progress><p id="usage" class="small"></p><ul id="job-items"></ul></section>
   <div class="list-head"><h2>插件能力</h2><input id="search" placeholder="搜索插件或能力" aria-label="搜索插件或能力"></div>

@@ -425,6 +425,27 @@ def _collect(context, descriptors: list) -> dict:
     return catalog
 
 
+def analysis_batches(record: dict) -> list[tuple[dict, str]]:
+    """Keep each model request small without dropping registered commands."""
+    batches = []
+    pending = {}
+    for entry in record["commands"].values():
+        if not entry["enabled"]:
+            continue
+        candidate = {**pending, entry["id"]: entry}
+        batch_record = {**record, "commands": candidate}
+        document = analysis_document(batch_record, 48000)
+        if pending and (len(candidate) > 3 or len(document) > 12000):
+            previous = {**record, "commands": pending}
+            batches.append((previous, analysis_document(previous, 48000)))
+            candidate = {entry["id"]: entry}
+        pending = candidate
+    if pending:
+        batch_record = {**record, "commands": pending}
+        batches.append((batch_record, analysis_document(batch_record, 48000)))
+    return batches
+
+
 def analysis_document(record: dict, limit: int) -> str:
     """Build a bounded model input from registered commands and source slices.
 

@@ -39,6 +39,7 @@ function render() {
   $('connection').textContent=s.enabled?'已连接 · 自然语言指令运行中':'自然语言指令已停用';
   if(!analysisDirty){
     providers($('provider'),s.settings.analysis_provider_id,'请选择分析模型');
+    $('analysis-timeout').value=s.settings.analysis_timeout||600;
     analysisRevision=s.settings_revision;
   }
   if(!settingsDirty){
@@ -63,8 +64,9 @@ function render() {
   $('cancel').hidden=!running;
   const items=s.job.items||[];
   $('progress').max=Math.max(1,items.length);$('progress').value=items.filter(i=>!['queued','analyzing'].includes(i.status)).length;
-  $('usage').textContent=`实际用量 ${(s.job.tokens||0).toLocaleString()} tokens${s.job.estimated_tokens?`；未返回用量的请求估计 ${s.job.estimated_tokens.toLocaleString()}`:''}`;
-  $('job-items').replaceChildren(...items.map(i=>node('li',`${i.plugin} · ${labels[i.status]||i.status}${i.capabilities!==undefined?` · ${i.capabilities} 项能力`:''}${i.error?` · ${i.error}`:''}`)));
+  $('usage').textContent=`服务商已报告 ${(s.job.tokens||0).toLocaleString()} tokens${s.job.estimated_tokens?`；已完成但未报告用量的响应约 ${s.job.estimated_tokens.toLocaleString()} tokens`:''}${s.job.pending_requests?'；1 个请求进行中，用量待返回':''}${s.job.unknown_requests?`；${s.job.unknown_requests} 个中断请求用量未知`:''}。以服务商账单为准。`;
+  const phases={waiting:'等待模型响应',thinking:'模型正在思考',receiving:'正在接收适配结果',validating:'正在校验'};
+  $('job-items').replaceChildren(...items.map(i=>node('li',`${i.plugin} · ${labels[i.status]||i.status}${i.batch?` · 第 ${i.batch} 批`:''}${i.status==='analyzing'?` · ${phases[i.phase]||'准备请求'} · 本批 ${i.elapsed_seconds||0}/${i.timeout_seconds||600} 秒${i.received_chars?` · 已收到 ${i.received_chars.toLocaleString()} 字符`:''}`:''}${i.resumed_batches?` · 复用 ${i.resumed_batches} 个已完成批次`:''}${i.capabilities!==undefined?` · ${i.capabilities} 项能力`:''}${i.error?` · ${i.error}`:''}`)));
   const search=$('search').value.toLowerCase();
   $('plugins').replaceChildren();
   for(const p of s.plugins){
@@ -97,7 +99,8 @@ function render() {
 async function refresh(){const next=await bridge.apiGet('status');const key=JSON.stringify(next);if(key===serialized)return;serialized=key;snapshot=next;render();}
 $('scan').onclick=()=>action('scan',{},'扫描完成，未调用分析模型');
 $('provider').onchange=()=>{analysisDirty=true;};
-$('save').onclick=async()=>{if(await action('settings',{analysis_provider_id:$('provider').value,revision:analysisRevision},'分析模型已保存')){analysisDirty=false;render();}};
+$('analysis-timeout').oninput=()=>{analysisDirty=true;};
+$('save').onclick=async()=>{if(!$('analysis-timeout').reportValidity())return;if(await action('settings',{analysis_provider_id:$('provider').value,analysis_timeout:Number($('analysis-timeout').value),revision:analysisRevision},'分析设置已保存')){analysisDirty=false;render();}};
 $('save-settings').onclick=async()=>{
   const data={enabled:$('setting-enabled').checked,confirmation_enabled:$('setting-confirmation').checked,execution_provider_id:$('execution-provider').value,allow_private_chat:$('setting-private').checked,group_whitelist_enabled:$('setting-whitelist-enabled').checked,group_whitelist:parseList('group-whitelist'),group_blacklist:parseList('group-blacklist'),user_blacklist:parseList('user-blacklist'),revision:settingsRevision};
   if(await action('settings',data,'设置已保存；运行设置变化时，旧确认码已失效')){settingsDirty=false;render();}

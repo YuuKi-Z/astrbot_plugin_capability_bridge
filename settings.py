@@ -8,6 +8,7 @@ DEFAULT_SETTINGS = {
     "enabled": True,
     "confirmation_enabled": True,
     "analysis_provider_id": "",
+    "analysis_timeout": 600,
     "execution_provider_id": "",
     "allow_private_chat": True,
     "group_whitelist_enabled": False,
@@ -27,6 +28,9 @@ def read_settings(config) -> dict:
         if isinstance(default, bool):
             if type(value) is not bool:
                 raise ValueError(f"设置 {key} 必须是开关")
+        elif type(default) is int:
+            if type(value) is not int or not 30 <= value <= 1800:
+                raise ValueError("单批分析超时必须是 30 到 1800 秒之间的整数")
         elif isinstance(default, list):
             if not isinstance(value, list) or len(value) > 500:
                 raise ValueError(f"设置 {key} 必须是不超过 500 项的名单")
@@ -62,6 +66,7 @@ def settings_revision(settings: dict, *, controls_only=False) -> str:
     values = dict(settings)
     if controls_only:
         values.pop("analysis_provider_id", None)
+        values.pop("analysis_timeout", None)
     return hashlib.sha256(
         json.dumps(values, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()

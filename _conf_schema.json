@@ -17,6 +17,12 @@
     "default": "",
     "_special": "select_provider"
   },
+  "analysis_timeout": {
+    "description": "单批分析超时（秒）",
+    "hint": "默认 600 秒。慢速或思考模型可适当调大，范围 30–1800 秒；模型服务自身的连接或读取超时仍然有效。只限制单批等待时间，不限制总 token 用量。",
+    "type": "int",
+    "default": 600
+  },
   "execution_provider_id": {
     "description": "对话 / 调用模型",
     "hint": "留空沿用 AstrBot 当前模型；选择后用于允许会话中的本地 Agent 对话和工具调用。不会额外增加一轮模型请求，不切换第三方托管 Agent。",

@@ -97,11 +97,26 @@ class SettingsTests(unittest.TestCase):
             settings_revision(first, controls_only=True),
             settings_revision(second, controls_only=True),
         )
+        second["analysis_timeout"] = 900
+        self.assertEqual(
+            settings_revision(first, controls_only=True),
+            settings_revision(second, controls_only=True),
+        )
         second["confirmation_enabled"] = False
         self.assertNotEqual(
             settings_revision(first, controls_only=True),
             settings_revision(second, controls_only=True),
         )
+
+    def test_analysis_timeout_validation(self):
+        self.assertEqual(read_settings({})["analysis_timeout"], 600)
+        for value in (False, "600", 0, 29, 1801, 60.5):
+            with self.assertRaises(ValueError):
+                validate_update(read_settings({}), {"analysis_timeout": value}, set())
+        for value in (30, 900, 1800):
+            self.assertEqual(
+                read_settings({"analysis_timeout": value})["analysis_timeout"], value
+            )
 
 
 if __name__ == "__main__":

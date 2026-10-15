@@ -1,5 +1,6 @@
 """Behavioral checks using real AstrBot filters and in-memory plugin fixtures."""
 
+import asyncio
 import copy
 import functools
 import json
@@ -15,11 +16,18 @@ from astrbot.core.star.filter.command import CommandFilter
 from astrbot.core.star.filter.command_group import CommandGroupFilter
 from astrbot.core.star.filter.permission import PermissionType, PermissionTypeFilter
 
+from ..analysis import generate
 from ..main import CapabilityBridge
 from ..plans import validate_plan
 from ..policy import PendingCalls
 from ..runtime import CapabilityError, execute, resolve_member
-from ..scanner import _collect, fingerprint, inspect_helpers, parameter_schema
+from ..scanner import (
+    _collect,
+    analysis_batches,
+    fingerprint,
+    inspect_helpers,
+    parameter_schema,
+)
 from ..settings import read_settings, settings_revision
 
 
@@ -811,6 +819,166 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             bridge.state["adaptations"]["fixture"]["capabilities"][0]["enabled"]
         )
+
+    def analysis_bridge(self, count=1):
+        bridge = object.__new__(CapabilityBridge)
+        bridge.context = self.context
+        bridge.state_path = Path(self.temp.name) / "state.json"
+        bridge.state = {"adaptations": {}}
+        self.record.update(description="Fixture", native_tools=[])
+        entry = self.record["commands"]["fixture.report"]
+        entry.update(
+            description="Report", source="async def report(event): ...", dependencies=[]
+        )
+        plans = []
+        for index in range(count):
+            key = f"fixture.report{index}" if index else "fixture.report"
+            self.record["commands"][key] = {**entry, "id": key}
+            plans.append({**copy.deepcopy(self.raw), "command_id": key})
+        bridge.catalog = {"fixture": self.record}
+        bridge.job = {
+            "items": [{"plugin": "fixture"}],
+            "tokens": 0,
+            "estimated_tokens": 0,
+        }
+        return bridge, plans
+
+    async def test_timed_out_batch_can_resume_without_paying_for_completed_batches(
+        self,
+    ):
+        bridge, plans = self.analysis_bridge(4)
+        self.context.llm_generate = AsyncMock(
+            side_effect=[
+                SimpleNamespace(
+                    completion_text=json.dumps({"capabilities": plans[:3]}),
+                    usage=SimpleNamespace(total=321),
+                ),
+                TimeoutError(),
+            ]
+        )
+        await bridge.analyze(["fixture"], {"provider_id": "fixture"})
+        self.assertEqual(bridge.job["items"][0]["status"], "failed")
+        self.assertIn("第 2/2 批", bridge.job["items"][0]["error"])
+        self.assertEqual(bridge.job["tokens"], 321)
+        self.assertEqual(bridge.job["estimated_tokens"], 0)
+        self.assertEqual(bridge.job["unknown_requests"], 1)
+        self.assertEqual(bridge.job["pending_requests"], 0)
+        saved = json.loads(bridge.state_path.read_text())
+        self.assertEqual(len(saved["analysis_checkpoints"]["fixture"]["batches"]), 1)
+        bridge.state = saved
+        bridge.job = {
+            "items": [{"plugin": "fixture"}],
+            "tokens": 0,
+            "estimated_tokens": 0,
+        }
+        self.context.llm_generate = AsyncMock(
+            return_value=SimpleNamespace(
+                completion_text=json.dumps({"capabilities": plans[3:]}),
+                usage=SimpleNamespace(total=100),
+            )
+        )
+        await bridge.analyze(["fixture"], {"provider_id": "fixture", "timeout": 900})
+        self.context.llm_generate.assert_awaited_once()
+        self.assertEqual(bridge.job["items"][0]["resumed_batches"], 1)
+        self.assertEqual(bridge.job["tokens"], 100)
+        self.assertEqual(len(bridge.state["adaptations"]["fixture"]["capabilities"]), 4)
+        self.assertNotIn("fixture", bridge.state["analysis_checkpoints"])
+        self.assertEqual(self.plugin.calls, [])
+
+    async def test_changed_analysis_model_does_not_reuse_previous_batches(self):
+        bridge, plans = self.analysis_bridge(4)
+        first = SimpleNamespace(
+            completion_text=json.dumps({"capabilities": plans[:3]}), usage=None
+        )
+        self.context.llm_generate = AsyncMock(side_effect=[first, TimeoutError()])
+        await bridge.analyze(["fixture"], {"provider_id": "one"})
+        self.context.llm_generate = AsyncMock(side_effect=[first, TimeoutError()])
+        await bridge.analyze(["fixture"], {"provider_id": "two"})
+        self.assertEqual(self.context.llm_generate.await_count, 2)
+        self.assertEqual(bridge.job["items"][0]["resumed_batches"], 0)
+
+    async def test_unknown_usage_is_estimated_only_after_response(self):
+        bridge, plans = self.analysis_bridge()
+
+        async def respond(**kwargs):
+            self.assertEqual(bridge.job["pending_requests"], 1)
+            self.assertEqual(bridge.job["estimated_tokens"], 0)
+            return SimpleNamespace(
+                completion_text=json.dumps({"capabilities": plans}), usage=None
+            )
+
+        self.context.llm_generate = AsyncMock(side_effect=respond)
+        await bridge.analyze(["fixture"], {"provider_id": "fixture"})
+        self.assertGreater(bridge.job["estimated_tokens"], 0)
+        self.assertEqual(bridge.job["pending_requests"], 0)
+
+    async def test_stream_final_response_is_not_concatenated_twice(self):
+        item = {"received_chars": 0, "reasoning_chars": 0}
+        final = SimpleNamespace(
+            completion_text='{"capabilities":[]}',
+            usage=SimpleNamespace(total=50),
+            reasoning_content=None,
+            is_chunk=False,
+        )
+
+        class StreamingProvider:
+            async def text_chat_stream(self, **kwargs):
+                yield SimpleNamespace(
+                    completion_text="",
+                    reasoning_content="private reasoning",
+                    is_chunk=True,
+                    usage=None,
+                )
+                yield SimpleNamespace(
+                    completion_text='{"capabilities":',
+                    reasoning_content=None,
+                    is_chunk=True,
+                    usage=None,
+                )
+                yield final
+
+        self.context.get_provider_by_id = lambda _: StreamingProvider()
+        response = await generate(self.context, "fixture", "document", item)
+        self.assertIs(response, final)
+        self.assertEqual(response.usage.total, 50)
+        self.assertEqual(item["phase"], "receiving")
+        self.assertNotIn("private reasoning", json.dumps(item))
+
+    async def test_stream_timeout_closes_generator_and_does_not_retry(self):
+        bridge, _ = self.analysis_bridge()
+        closed = []
+
+        class StreamingProvider:
+            async def text_chat_stream(self, **kwargs):
+                try:
+                    yield SimpleNamespace(
+                        completion_text="",
+                        reasoning_content="thinking",
+                        is_chunk=True,
+                        usage=None,
+                    )
+                    await asyncio.sleep(1000)
+                finally:
+                    closed.append(True)
+
+        self.context.get_provider_by_id = lambda _: StreamingProvider()
+        self.context.llm_generate = AsyncMock()
+        await bridge.analyze(["fixture"], {"provider_id": "fixture", "timeout": 0.01})
+        self.assertEqual(closed, [True])
+        self.assertEqual(bridge.job["items"][0]["status"], "failed")
+        self.context.llm_generate.assert_not_called()
+        self.assertEqual(bridge.job["estimated_tokens"], 0)
+
+    def test_analysis_batching_keeps_all_commands_and_bounds_large_requests(self):
+        _, _ = self.analysis_bridge(7)
+        for command in self.record["commands"].values():
+            command["source"] = "x" * 2600
+            command["dependencies"] = ["x" * 1000, "x" * 1000]
+        batches = analysis_batches(self.record)
+        ids = [key for record, _ in batches for key in record["commands"]]
+        self.assertEqual(ids, list(self.record["commands"]))
+        self.assertTrue(all(len(record["commands"]) <= 3 for record, _ in batches))
+        self.assertTrue(all(len(document) <= 12000 for _, document in batches))
 
     async def test_message_tail_is_scanned_and_passed_as_event_text(self):
         metadata = self.record["metadata"]

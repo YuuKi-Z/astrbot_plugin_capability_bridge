@@ -4,7 +4,6 @@ import asyncio
 import copy
 import functools
 import json
-import math
 import re
 import time
 from pathlib import Path
@@ -18,21 +17,18 @@ from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 from jsonschema.exceptions import SchemaError
 
+from .analysis import checkpoint_key, estimated_tokens, generate
 from .plans import parse_response, validate_plan
 from .policy import POLICY_MODES, PendingCalls, call_policy
 from .prompts import ANALYZE_PROMPT
 from .runtime import CapabilityError, check_access, execute
-from .scanner import PLUGIN_NAME, analysis_document, scan
+from .scanner import PLUGIN_NAME, analysis_batches, scan
 from .settings import access_error, read_settings, settings_revision, validate_update
 
 BRIDGE_INSTRUCTION = """\n[CAPABILITY_BRIDGE]
 用户明确请求执行某个功能时，主动判断并调用可用工具。需要查找插件功能时先调用 capability_find，按返回的参数说明调用 capability_run；原生工具直接用其原名调用。不把‘能不能帮我查/生成’仅回答成能力介绍。缺少必要信息才追问。能力不存在或未适配要如实说明，不能编造已执行。target_user 必须来自用户的明确指代，查别人不能替换成自己。工具返回 delivered/do_not_repeat 表示原插件已发送结果，不重复转述整份结果。\n"""
 
 BRIDGE_INSTRUCTION += "返回 confirmation_required 表示尚未执行，必须由请求者在原会话发送提示中的确认指令；不能代替用户确认，也不能改用其他工具绕过。\n"
-
-
-ANALYSIS_SOURCE_LIMIT = 48000
-ANALYSIS_OUTPUT_TOKENS = 6000
 
 
 class CapabilityBridge(Star):
@@ -49,6 +45,7 @@ class CapabilityBridge(Star):
             "settings": {"provider_id": ""},
             "adaptations": {},
             "policies": {},
+            "analysis_checkpoints": {},
         }
         if self.state_path.exists():
             try:
@@ -59,6 +56,8 @@ class CapabilityBridge(Star):
                 self.state["adaptations"] = loaded.get("adaptations", {})
                 if isinstance(loaded.get("policies"), dict):
                     self.state["policies"] = loaded["policies"]
+                if isinstance(loaded.get("analysis_checkpoints"), dict):
+                    self.state["analysis_checkpoints"] = loaded["analysis_checkpoints"]
                 self.state["config_settings_migrated"] = bool(
                     loaded.get("config_settings_migrated", False)
                 )
@@ -227,7 +226,22 @@ class CapabilityBridge(Star):
             "settings_revision": settings_revision(self.settings()),
             "providers": providers,
             "plugins": plugins,
-            "job": self.job,
+            "job": {
+                **self.job,
+                "items": [
+                    {
+                        **item,
+                        "elapsed_seconds": max(
+                            0,
+                            int(time.time()) - item["request_started_at"],
+                        )
+                        if item.get("request_started_at")
+                        and item.get("status") == "analyzing"
+                        else item.get("elapsed_seconds", 0),
+                    }
+                    for item in self.job["items"]
+                ],
+            },
         }
 
     async def api_status(self):
@@ -295,7 +309,11 @@ class CapabilityBridge(Star):
             or any(n not in self.catalog for n in selected)
         ):
             return error_response("插件选择无效")
-        settings = {"provider_id": self.settings()["analysis_provider_id"]}
+        values = self.settings()
+        settings = {
+            "provider_id": values["analysis_provider_id"],
+            "timeout": values["analysis_timeout"],
+        }
         if settings["provider_id"] not in {
             p.meta().id for p in self.context.get_all_providers()
         }:
@@ -323,6 +341,8 @@ class CapabilityBridge(Star):
             "items": [{"plugin": n, "status": "queued"} for n in names],
             "tokens": 0,
             "estimated_tokens": 0,
+            "pending_requests": 0,
+            "unknown_requests": 0,
         }
         self.job_task = asyncio.create_task(self.analyze(names, settings))
         return json_response({"started": True, "plugins": names})
@@ -345,50 +365,83 @@ class CapabilityBridge(Star):
                 tokens = 0
                 try:
                     parsed = {"capabilities": [], "unsupported": []}
-                    commands = [e for e in record["commands"].values() if e["enabled"]]
-                    batches = [commands[i : i + 8] for i in range(0, len(commands), 8)]
-                    for batch_index, batch in enumerate(batches):
-                        item["batch"] = f"{batch_index + 1}/{len(batches)}"
-                        batch_record = {
-                            **record,
-                            "commands": {e["id"]: e for e in batch},
+                    batches = analysis_batches(record)
+                    checkpoints = self.state.setdefault("analysis_checkpoints", {})
+                    checkpoint = checkpoints.get(name, {})
+                    if (
+                        checkpoint.get("fingerprint") != record["fingerprint"]
+                        or checkpoint.get("provider_id") != settings["provider_id"]
+                    ):
+                        checkpoint = {
+                            "fingerprint": record["fingerprint"],
+                            "provider_id": settings["provider_id"],
+                            "batches": {},
                         }
-                        document = analysis_document(
-                            batch_record, ANALYSIS_SOURCE_LIMIT
-                        )
-                        # A conservative character estimate reserves output before each call.
-                        estimate = (
-                            len(document) + len(ANALYZE_PROMPT) + ANALYSIS_OUTPUT_TOKENS
-                        )
-                        self.job["estimated_tokens"] += estimate
-                        response = await asyncio.wait_for(
-                            self.context.llm_generate(
-                                chat_provider_id=settings["provider_id"],
-                                prompt=document,
-                                system_prompt=ANALYZE_PROMPT,
-                                max_tokens=ANALYSIS_OUTPUT_TOKENS,
-                                temperature=0.1,
-                            ),
-                            timeout=180,
-                        )
-                        self.job["estimated_tokens"] -= estimate
-                        usage = getattr(response, "usage", None)
-                        batch_tokens = int(usage.total) if usage else 0
-                        tokens += batch_tokens
-                        if batch_tokens:
-                            self.job["tokens"] += batch_tokens
+                        checkpoints[name] = checkpoint
+                    item.update(completed_batches=0, resumed_batches=0)
+                    for batch_index, (batch_record, document) in enumerate(batches):
+                        item["batch"] = f"{batch_index + 1}/{len(batches)}"
+                        key = checkpoint_key(document)
+                        cached = checkpoint["batches"].get(key)
+                        if cached is not None:
+                            part = cached
+                            item["resumed_batches"] += 1
                         else:
-                            self.job["estimated_tokens"] += math.ceil(
-                                (
-                                    len(document)
-                                    + len(ANALYZE_PROMPT)
-                                    + len(response.completion_text)
-                                )
-                                / 1.5
+                            timeout = settings.get("timeout", 600)
+                            item.update(
+                                phase="waiting",
+                                request_started_at=int(time.time()),
+                                timeout_seconds=timeout,
+                                received_chars=0,
+                                reasoning_chars=0,
+                                last_response_at=None,
+                                command_count=len(batch_record["commands"]),
                             )
-                        part = parse_response(response.completion_text)
+                            self.job["pending_requests"] = 1
+                            try:
+                                response = await asyncio.wait_for(
+                                    generate(
+                                        self.context,
+                                        settings["provider_id"],
+                                        document,
+                                        item,
+                                    ),
+                                    timeout=timeout,
+                                )
+                            except BaseException:
+                                self.job["unknown_requests"] = (
+                                    self.job.get("unknown_requests", 0) + 1
+                                )
+                                raise
+                            finally:
+                                self.job["pending_requests"] = 0
+                                item["elapsed_seconds"] = max(
+                                    0, int(time.time()) - item["request_started_at"]
+                                )
+                            usage = getattr(response, "usage", None)
+                            batch_tokens = int(usage.total) if usage else 0
+                            tokens += batch_tokens
+                            if batch_tokens:
+                                self.job["tokens"] += batch_tokens
+                            else:
+                                self.job["estimated_tokens"] += estimated_tokens(
+                                    document + ANALYZE_PROMPT + response.completion_text
+                                )
+                            item["phase"] = "validating"
+                            part = parse_response(response.completion_text)
+                            # Cache only declarations that pass the same source checks.
+                            # Invalid responses remain retryable on a later user request.
+                            try:
+                                for raw in part["capabilities"]:
+                                    validate_plan(raw, batch_record)
+                            except (ValueError, TypeError, KeyError, SchemaError):
+                                pass
+                            else:
+                                checkpoint["batches"][key] = part
+                                self.save()
                         parsed["capabilities"].extend(part["capabilities"])
                         parsed["unsupported"].extend(part.get("unsupported") or [])
+                        item["completed_batches"] += 1
                     capabilities, rejected, seen = [], [], set()
                     for raw in parsed["capabilities"][:500]:
                         try:
@@ -438,6 +491,7 @@ class CapabilityBridge(Star):
                         and previous.get("capabilities")
                         and previous.get("fingerprint") == record["fingerprint"]
                     ):
+                        checkpoints.pop(name, None)
                         raise ValueError("本次未产生有效适配，保留已有规则")
                     self.state["adaptations"][name] = {
                         "fingerprint": record["fingerprint"],
@@ -447,6 +501,7 @@ class CapabilityBridge(Star):
                         "tokens": tokens,
                         "provider_id": settings["provider_id"],
                     }
+                    checkpoints.pop(name, None)
                     self.save()
                     item.update(
                         status="completed",
@@ -457,6 +512,18 @@ class CapabilityBridge(Star):
                 except asyncio.CancelledError:
                     item["status"] = "cancelled"
                     raise
+                except (TimeoutError, asyncio.TimeoutError):
+                    item.update(
+                        status="failed",
+                        error=(
+                            f"第 {item.get('batch', '?')} 批模型请求超时"
+                            f"（已等待 {item.get('elapsed_seconds', 0)} 秒）。"
+                            "已完成批次已保存，再次适配会接着处理。"
+                            "可检查模型服务、调大单批超时或切换分析模型。"
+                            "本次请求未返回实际用量，无法确认计费。"
+                        ),
+                        tokens=tokens,
+                    )
                 except Exception as exc:  # noqa: BLE001 - Isolate provider and plugin failures.
                     # Provider exceptions can contain URLs and credentials; log only type.
                     logger.warning(
